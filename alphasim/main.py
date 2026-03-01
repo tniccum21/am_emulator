@@ -162,9 +162,9 @@ def run(config: SystemConfig) -> None:
             if instruction_count % batch_size == 0:
                 data = _check_stdin()
                 if data:
-                    # Ctrl-] to exit emulator
-                    if b"\x1d" in data:
-                        sys.stderr.write("\n[EXIT] Ctrl-] pressed.\n")
+                    # Ctrl-C or Ctrl-] to exit emulator
+                    if b"\x03" in data or b"\x1d" in data:
+                        sys.stderr.write("\n[EXIT] User interrupt.\n")
                         break
                     acia.send_to_port(0, data)
 
