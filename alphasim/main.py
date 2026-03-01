@@ -243,6 +243,10 @@ def main() -> None:
         help="Path to disk image file"
     )
     parser.add_argument(
+        "--self-test", action="store_true",
+        help="Run ROM self-test diagnostics (sets DIP bit 5)"
+    )
+    parser.add_argument(
         "--trace", action="store_true",
         help="Enable instruction trace"
     )
@@ -263,11 +267,15 @@ def main() -> None:
 
     bp_list = [int(b, 16) for b in args.breakpoints]
 
+    dip_value = args.dip
+    if args.self_test:
+        dip_value |= 0x20  # Set bit 5 for diagnostic mode
+
     config = SystemConfig(
         rom_even_path=args.rom_even,
         rom_odd_path=args.rom_odd,
         ram_size=args.ram,
-        config_dip=args.dip,
+        config_dip=dip_value,
         disk_image_path=args.disk,
         trace_enabled=args.trace,
         trace_file=args.trace_file,

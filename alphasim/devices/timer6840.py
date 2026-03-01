@@ -22,12 +22,16 @@ Control Register 1/3 bits:
     Bit 1: Interrupt enable
     Bits 2-4: Operating mode
     Bit 6: Internal/external clock (0=external, 1=internal)
-    Bit 7: CR1 only — enable all timers; CR3 only — prescale/reset
+    Bit 7: CR1 only — timer system preset (0=counting, 1=held)
+           CR3 only — T3 prescale (0=off, 1=divide by 8)
 
-Control Register 2 bits:
+Control Register 2 bits (shifted layout — T2 controls at bits 1-7):
     Bit 0: CR10 — register select (0=CR3, 1=CR1 for reg 0 writes)
-    Bits 1-6: Timer 2 control (mirrors CR1/CR3 bit layout shifted)
-    Bit 7: Prescale
+    Bit 1: T2 output enable
+    Bit 2: T2 interrupt enable
+    Bits 3-5: T2 operating mode
+    Bit 6: T2 count mode
+    Bit 7: T2 clock source (0=external, 1=internal)
 
 Status Register bits (read at reg 0 or reg 1):
     Bit 0: Timer 1 interrupt flag
@@ -41,6 +45,12 @@ flags — the ISR must perform the two-step read sequence.
 
 Clock: 1 MHz input → 1 tick per microsecond.
 CPU clock ≈ 8 MHz → ~8 CPU cycles per timer tick.
+
+AM-1200 interrupt routing:
+    The MC6840 drives IPL level 6 via autovector (vector 30 at $078).
+    Interrupt is edge-triggered: pending is set on any flag 0→1 transition
+    and cleared by IACK. This allows one interrupt per timer underflow
+    rather than continuous re-interruption while a flag stays set.
 """
 
 from __future__ import annotations
@@ -81,6 +91,10 @@ class Timer6840(IODevice):
         # Reading status "arms" these; reading the counter clears them.
         self._clearing_armed = [False, False, False]
 
+        # Edge-triggered interrupt: set on flag 0→1 transition,
+        # cleared by acknowledge_interrupt (IACK).
+        self._interrupt_pending = False
+
         # Timer enabled state
         self._timers_enabled = False
 
@@ -91,7 +105,16 @@ class Timer6840(IODevice):
         if self._debug:
             print(f"[TIMER] {msg}", file=sys.stderr)
 
-    # ── Interrupt enable helpers ────────────────────────────────────
+    # ── Clock source and interrupt enable helpers ─────────────────
+
+    def _uses_internal_clock(self, timer: int) -> bool:
+        """Check if a timer is configured for the internal clock."""
+        if timer == 0:
+            return bool(self._cr1 & 0x40)   # CR1 bit 6
+        elif timer == 1:
+            return bool(self._cr2 & 0x80)   # CR2 bit 7 (shifted: T2 clock)
+        else:
+            return bool(self._cr3 & 0x40)   # CR3 bit 6
 
     def _irq_enabled(self, timer: int) -> bool:
         """Check if interrupt is enabled for a timer channel."""
@@ -171,12 +194,7 @@ class Timer6840(IODevice):
             else:
                 self._cr3 = value
                 self._trace(f"CR3 = ${value:02X}")
-                if value & 0x80:
-                    # Timer reset
-                    self._trace("Timer reset")
-                    self._counter = [0xFFFF, 0xFFFF, 0xFFFF]
-                    self._irq_flag = [False, False, False]
-                    self._clearing_armed = [False, False, False]
+                # CR3 bit 7: T3 prescale control (not a timer reset)
 
         elif reg == 1:
             self._cr2 = value
@@ -199,7 +217,11 @@ class Timer6840(IODevice):
             self._trace(f"Timer {timer+1} loaded = ${self._latch[timer]:04X}")
 
     def tick(self, cycles: int) -> None:
-        """Advance timer counters by elapsed CPU cycles."""
+        """Advance timer counters by elapsed CPU cycles.
+
+        Only timers configured for the internal clock are decremented.
+        Timers using an external clock source are not affected.
+        """
         if not self._timers_enabled:
             return
 
@@ -210,6 +232,10 @@ class Timer6840(IODevice):
         self._cycle_accum %= CPU_TIMER_RATIO
 
         for i in range(3):
+            # Only decrement timers using the internal clock
+            if not self._uses_internal_clock(i):
+                continue
+
             # MC6840: counter value 0 counts as 65536 (full 16-bit period).
             # The counter decrements from N to 1, then flags on the transition
             # to 0.  A loaded value of 0 means a full 65536-tick period.
@@ -219,32 +245,44 @@ class Timer6840(IODevice):
 
             if new <= 0:
                 # Underflow occurred — counter crossed zero
+                was_flagged = self._irq_flag[i]
                 self._irq_flag[i] = True
+                # Edge-triggered: only assert pending on 0→1 transition
+                if not was_flagged:
+                    self._interrupt_pending = True
+                    self._trace(f"Timer {i+1} underflow → IRQ pending")
                 # Reload from latch (continuous mode)
                 reload = self._latch[i] if self._latch[i] > 0 else 0x10000
                 # Handle multiple underflows in one tick batch
                 remainder = (-new) % reload
                 self._counter[i] = (reload - remainder) & 0xFFFF
-                if self._irq_enabled(i):
-                    self._trace(f"Timer {i+1} underflow → IRQ")
             else:
                 self._counter[i] = new & 0xFFFF
 
     def get_interrupt_level(self) -> int:
-        """MC6840 PTM generates IPL 3 interrupts."""
-        for i in range(3):
-            if self._irq_flag[i] and self._irq_enabled(i):
-                return 3
+        """MC6840 PTM generates IPL 6 interrupts in the AM-1200.
+
+        Edge-triggered: returns level 6 only when an interrupt is pending
+        (flag just transitioned 0→1). Cleared by acknowledge_interrupt.
+        """
+        if self._interrupt_pending:
+            return 6
         return 0
 
     def get_interrupt_vector(self) -> int:
-        """Timer provides vector 66 during IACK (IPL 3 → vector 66)."""
-        return 66
+        """MC6840 is a 6800-family peripheral using VPA autovector.
+
+        Return 0 to indicate autovector mode — the CPU will use
+        vector 24 + IPL level (= vector 30 for level 6).
+        """
+        return 0
 
     def acknowledge_interrupt(self, level: int) -> None:
-        """IACK cycle — MC6840 does NOT clear flags on IACK.
+        """IACK cycle — clear the edge-triggered pending state.
 
+        The interrupt flags themselves are NOT cleared by IACK.
         The ISR must clear flags via the two-step sequence:
         read status register, then read the flagged timer's counter.
         """
-        self._trace("IACK: acknowledged (flags NOT cleared)")
+        self._interrupt_pending = False
+        self._trace("IACK: acknowledged, pending cleared")
