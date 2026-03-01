@@ -25,4 +25,8 @@ class LED(IODevice):
     def write(self, address: int, size: int, value: int) -> None:
         self.value = value & 0xFF
         self.history.append(self.value)
-        print(f"[LED] ${self.value:02X}", file=sys.stderr)
+        # Flush stdout so any partial ACIA line is written before LED output.
+        # Write \r to return cursor to column 0 in case ACIA left it mid-line.
+        sys.stdout.buffer.write(b"\r")
+        sys.stdout.buffer.flush()
+        sys.stderr.write(f"[LED] ${self.value:02X}\n")
