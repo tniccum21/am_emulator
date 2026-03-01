@@ -120,6 +120,7 @@ def run(config: SystemConfig) -> None:
             ch = bytes([byte_val])
             sys.stdout.buffer.write(ch)
             sys.stdout.buffer.flush()
+            led.stdout_mid_line = (byte_val != 0x0A)  # not mid-line after \n
 
     acia.tx_callback = _tx_callback
 

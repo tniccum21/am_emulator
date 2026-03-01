@@ -18,6 +18,7 @@ class LED(IODevice):
     def __init__(self):
         self.value: int = 0
         self.history: list[int] = []
+        self.stdout_mid_line = False  # tracks if ACIA left cursor mid-line
 
     def read(self, address: int, size: int) -> int:
         return 0xFF  # write-only; reads return bus float
@@ -25,8 +26,9 @@ class LED(IODevice):
     def write(self, address: int, size: int, value: int) -> None:
         self.value = value & 0xFF
         self.history.append(self.value)
-        # Flush stdout so any partial ACIA line is written before LED output.
-        # Write \r to return cursor to column 0 in case ACIA left it mid-line.
-        sys.stdout.buffer.write(b"\r")
         sys.stdout.buffer.flush()
-        sys.stderr.write(f"[LED] ${self.value:02X}\n")
+        if self.stdout_mid_line:
+            sys.stderr.write(f"\n[LED] ${self.value:02X}\n")
+            self.stdout_mid_line = False
+        else:
+            sys.stderr.write(f"[LED] ${self.value:02X}\n")
