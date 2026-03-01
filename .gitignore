@@ -5,3 +5,5 @@ __pycache__/
 roms/
 binaries/
 debug_*.py
+.venv/
+*.egg-info/
