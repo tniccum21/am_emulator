@@ -1,5 +1,6 @@
 """Front panel LED display at $FE00 (write-only)."""
 
+import sys
 from .base import IODevice
 
 
@@ -7,10 +8,11 @@ class LED(IODevice):
     """7-segment LED status display.
 
     Boot ROM LED codes:
-      6  = hardware init starting
-      11 = controller init in progress
-      0  = trying next drive / success
-      14 = OS handoff (boot complete)
+      $06 = hardware init starting
+      $0B = controller init in progress
+      $00 = trying next drive / success
+      $0E = OS handoff (boot complete)
+      $80+ = self-test diagnostic codes
     """
 
     def __init__(self):
@@ -23,4 +25,4 @@ class LED(IODevice):
     def write(self, address: int, size: int, value: int) -> None:
         self.value = value & 0xFF
         self.history.append(self.value)
-        print(f"[LED] {self.value}")
+        print(f"[LED] ${self.value:02X}", file=sys.stderr)

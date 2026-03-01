@@ -26,7 +26,7 @@ DIP value `0x2A` = `0x0A` (SCSI controller) | `0x20` (bit 5 = self-test mode).
 python3 debug_selftest_output.py
 ```
 
-This script captures all ACIA output to stdout and runs for 250M instructions.
+This script captures all ACIA output to stdout and runs for 250M instructions. LED changes and boot messages go to stderr.
 
 ## Expected Output
 
