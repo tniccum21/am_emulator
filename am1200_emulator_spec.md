@@ -230,13 +230,58 @@ The boot ROM supports multiple controller types selected by config DIP bits [3:0
 - 6: SCSI Floppy
 - 7+: SMD variants
 
-#### 2.5.5 Timer (6840 PTM, schematic sheet 10)
+#### 2.5.5 Timer (MC6840 PTM, schematic sheet 10)
 
-| Address     | Register | Description         |
-|-------------|----------|---------------------|
-| $FFFD00+    | Timer    | 6840 Programmable Timer Module |
+The MC6840 Programmable Timer Module provides 3 independent 16-bit timer channels. It is an 8-bit device on the lower data bus (D0-D7), so registers appear at **odd byte addresses** only. Even addresses are inactive (read as $00).
 
-The 6840 provides 3 independent 16-bit timer channels. The AM-1000 schematic (sheet 8) shows it clocked from a 1 MHz input (via address decode timing), with the output driving interrupt logic. The AM-1200 uses a similar arrangement.
+| Address   | Reg | Write                 | Read                      |
+|-----------|-----|-----------------------|---------------------------|
+| $FFFE11   | 0   | CR1 or CR3 (sel CR2.0)| Status Register           |
+| $FFFE13   | 1   | CR2                   | Status Register           |
+| $FFFE15   | 2   | Timer 1 MSB latch     | Timer 1 counter MSB       |
+| $FFFE17   | 3   | Timer 1 LSB latch     | Timer 1 counter LSB       |
+| $FFFE19   | 4   | Timer 2 MSB latch     | Timer 2 counter MSB       |
+| $FFFE1B   | 5   | Timer 2 LSB latch     | Timer 2 counter LSB       |
+| $FFFE1D   | 6   | Timer 3 MSB latch     | Timer 3 counter MSB       |
+| $FFFE1F   | 7   | Timer 3 LSB latch     | Timer 3 counter LSB       |
+
+**Control Register 1/3 bits** (CR1 and CR3 share reg 0, selected by CR2 bit 0):
+
+| Bit   | CR1 Meaning              | CR3 Meaning              |
+|-------|--------------------------|--------------------------|
+| 0     | Output enable            | Output enable            |
+| 1     | Interrupt enable         | Interrupt enable         |
+| 2-4   | Operating mode           | Operating mode           |
+| 6     | Clock source (0=ext, 1=int) | Clock source (0=ext, 1=int) |
+| 7     | Timer system preset (0=run, 1=hold) | T3 prescale (0=off, 1=÷8) |
+
+**Control Register 2 bits** (shifted layout — T2 controls at bits 1-7):
+
+| Bit | Meaning                                    |
+|-----|--------------------------------------------|
+| 0   | CR10 — register select (0=CR3, 1=CR1)     |
+| 1   | T2 output enable                           |
+| 2   | T2 interrupt enable                        |
+| 3-5 | T2 operating mode                          |
+| 6   | T2 count mode                              |
+| 7   | T2 clock source (0=external, 1=internal)   |
+
+**Status Register** (read at reg 0 or reg 1):
+
+| Bit | Meaning                                    |
+|-----|--------------------------------------------|
+| 0   | Timer 1 interrupt flag                     |
+| 1   | Timer 2 interrupt flag                     |
+| 2   | Timer 3 interrupt flag                     |
+| 7   | Composite IRQ (OR of bits 0-2, masked by enables) |
+
+**Key behaviors:**
+- Clock: 1 MHz input → 1 tick per microsecond. CPU at 8 MHz → 8 CPU cycles per timer tick.
+- Counter value $0000 counts as 65536 ticks (full 16-bit period).
+- Flag clearing: Two-step sequence — read Status Register, then read flagged timer's counter. IACK does NOT clear flags.
+- Interrupt: Edge-triggered in AM-1200 wiring. Pending set on flag 0→1 transition, cleared by IACK cycle.
+- IPL level: **6** (autovector → vector 30 at $078). See §2.6 for correction from earlier draft.
+- Only timers configured for the internal clock (CRx bit 6/7 = 1) are decremented by the system clock. External-clock timers require an external signal.
 
 #### 2.5.6 Calendar/RTC (schematic sheet 12)
 
@@ -269,14 +314,16 @@ A single byte write to $FE00 controls the front panel 7-segment display. The boo
 
 The 68010 uses a 3-bit encoded interrupt priority level (IPL0–IPL2). From schematic sheet 2, the interrupt encoder (U108, priority encoder) maps device interrupts to IPL levels:
 
-| IPL Level | Source(s)                               |
-|-----------|-----------------------------------------|
-| 1         | Serial port (MAININT# from sheet 7)     |
-| 2         | SASI disk controller (from sheet 10)    |
-| 3         | Timer (6840)                            |
-| 4         | SIO expansion (INTR from sheets 8–9)    |
-| 5         | Multi-comm / VCR                        |
-| 7         | NMI (power fail — PWFAIL, sheet 5)      |
+| IPL Level | Source(s)                               | Vector Mode  |
+|-----------|------------------------------------------|-------------|
+| 1         | Serial port (MAININT# from sheet 7)     | Autovector   |
+| 2         | SASI disk controller (from sheet 10)    | Autovector   |
+| 4         | SIO expansion (INTR from sheets 8–9)    | Autovector   |
+| 5         | Multi-comm / VCR                        | Autovector   |
+| 6         | Timer (MC6840 PTM)                      | Autovector   |
+| 7         | NMI (power fail — PWFAIL, sheet 5)      | Autovector   |
+
+**Note:** The MC6840 timer is at IPL 6, not IPL 3 as stated in an earlier draft. This was confirmed by the ROM self-test, which installs the timer interrupt handler at vector 30 ($078) = autovector for level 6. The MC6840 is a 6800-family peripheral that asserts VPA (Valid Peripheral Address) during IACK, triggering autovector mode rather than providing a vector number on the data bus.
 
 ### 2.7 DMA
 
