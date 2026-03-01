@@ -183,7 +183,7 @@ def run(config: SystemConfig) -> None:
         f"  A: {' '.join(f'{cpu.a[i]:08X}' for i in range(8))}\n"
     )
     sys.stderr.write(
-        f"  LED: ${led.value:02X}  history: [{', '.join(f'${v:02X}' for v in led.history)}]\n"
+        f"  LED: {led.value:02X}  history: [{', '.join(f'{v:02X}' for v in led.history)}]\n"
     )
     sys.stderr.write(
         f"  Instructions: {instruction_count}  Cycles: {cpu.cycles}\n"
