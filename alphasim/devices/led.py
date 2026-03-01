@@ -26,9 +26,8 @@ class LED(IODevice):
     def write(self, address: int, size: int, value: int) -> None:
         self.value = value & 0xFF
         self.history.append(self.value)
-        sys.stdout.buffer.flush()
         if self.stdout_mid_line:
-            sys.stderr.write(f"\n[LED] ${self.value:02X}\n")
+            sys.stdout.buffer.write(b"\n")
             self.stdout_mid_line = False
-        else:
-            sys.stderr.write(f"[LED] ${self.value:02X}\n")
+        sys.stdout.buffer.write(f"[LED] ${self.value:02X}\n".encode())
+        sys.stdout.buffer.flush()
