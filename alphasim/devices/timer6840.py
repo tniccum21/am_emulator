@@ -219,8 +219,10 @@ class Timer6840(IODevice):
     def tick(self, cycles: int) -> None:
         """Advance timer counters by elapsed CPU cycles.
 
-        Only timers configured for the internal clock are decremented.
-        Timers using an external clock source are not affected.
+        All timers are decremented regardless of clock source setting.
+        The AM-1200 provides a 1 MHz external clock to the MC6840,
+        matching the internal clock rate, so both sources tick at the
+        same frequency (~1 tick per 8 CPU cycles).
         """
         if not self._timers_enabled:
             return
@@ -232,9 +234,6 @@ class Timer6840(IODevice):
         self._cycle_accum %= CPU_TIMER_RATIO
 
         for i in range(3):
-            # Only decrement timers using the internal clock
-            if not self._uses_internal_clock(i):
-                continue
 
             # MC6840: counter value 0 counts as 65536 (full 16-bit period).
             # The counter decrements from N to 1, then flags on the transition
