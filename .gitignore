@@ -4,6 +4,9 @@ __pycache__/
 .DS_Store
 roms/
 binaries/
+images/
 debug_*.py
+debug_*.log
+*.log
 .venv/
 *.egg-info/
