@@ -54,6 +54,8 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     # MC6850 ACIA serial ports at $FFFE20-$FFFE32
     acia = ACIA6850()
     bus.register_device(0xFFFE20, 0xFFFE32, acia)
+    # HW.SER alias: console ACIA at $FFFFC8 (status) / $FFFFC9 (data)
+    bus.register_device(0xFFFFC8, 0xFFFFC9, acia)
 
     # SASI/SCSI controller at $FFFFE0-$FFFFE7
     sasi = SASIController()
