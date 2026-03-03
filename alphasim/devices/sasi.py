@@ -141,11 +141,20 @@ class SASIController(IODevice):
 
     # ── Command handling ──────────────────────────────────────────
 
+    def acknowledge_interrupt(self, level: int) -> None:
+        """IACK — clear the pending interrupt."""
+        self._irq_pending = False
+
     def _exec_dat_command(self, cmd: int) -> None:
         """Handle command byte written to reg 0 (DAT)."""
+        self._irq_pending = False  # New command cancels stale interrupt
         if cmd == 0x18:
             # READ SECTOR — compute LBA from CHS registers, read data
             self._do_read_sector()
+            self._irq_pending = True  # Signal command completion
+        elif cmd == 0x0C or cmd == 0x58:
+            # RESTORE / RECALIBRATE — seek complete
+            self._irq_pending = True
         elif cmd == 0x84:
             # PIO START — reset data index for byte transfer via reg 4
             self._data_index = 0
