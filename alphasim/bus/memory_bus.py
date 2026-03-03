@@ -180,17 +180,29 @@ class MemoryBus:
     # ── Device ticking ───────────────────────────────────────────────
 
     def tick(self, cycles: int) -> None:
-        """Advance all registered devices by the given number of cycles."""
+        """Advance all registered devices by the given number of cycles.
+
+        Uses identity dedup so devices registered at multiple address
+        ranges (e.g. ACIA at main ports + HW.SER alias) are ticked once.
+        """
+        seen: set[int] = set()
         for _, _, device in self._devices:
-            device.tick(cycles)
+            did = id(device)
+            if did not in seen:
+                seen.add(did)
+                device.tick(cycles)
 
     def get_highest_interrupt(self) -> int:
         """Poll all devices and return the highest pending interrupt level."""
         highest = 0
+        seen: set[int] = set()
         for _, _, device in self._devices:
-            level = device.get_interrupt_level()
-            if level > highest:
-                highest = level
+            did = id(device)
+            if did not in seen:
+                seen.add(did)
+                level = device.get_interrupt_level()
+                if level > highest:
+                    highest = level
         return highest
 
     def acknowledge_interrupt(self, level: int) -> int:
@@ -202,10 +214,14 @@ class MemoryBus:
         Returns the vector number from the device, or 0 for autovector.
         """
         vector = 0
+        seen: set[int] = set()
         for _, _, device in self._devices:
-            if device.get_interrupt_level() == level:
-                device.acknowledge_interrupt(level)
-                vec = device.get_interrupt_vector()
-                if vec:
-                    vector = vec
+            did = id(device)
+            if did not in seen:
+                seen.add(did)
+                if device.get_interrupt_level() == level:
+                    device.acknowledge_interrupt(level)
+                    vec = device.get_interrupt_vector()
+                    if vec:
+                        vector = vec
         return vector
