@@ -21,6 +21,7 @@ from .devices.led import LED
 from .devices.config_dip import ConfigDIP
 from .devices.sasi import SASIController
 from .devices.acia6850 import ACIA6850
+from .devices.primary_serial_setup import PrimarySerialSetup
 from .devices.timer6840 import Timer6840
 from .devices.rtc_msm5832 import RTC_MSM5832
 from .storage.disk_image import DiskImage
@@ -56,9 +57,14 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     timer = Timer6840()
     bus.register_device(0xFFFE10, 0xFFFE1F, timer)
 
-    # MC6850 ACIA serial ports at $FFFE20-$FFFE32
+    # Primary serial register block.
+    # The ROM self-test uses $FFFE20/$24/$30 as the three port bases and
+    # writes a separate setup sequence to $FFFE28.
     acia = ACIA6850()
-    bus.register_device(0xFFFE20, 0xFFFE32, acia)
+    bus.register_device(0xFFFE20, 0xFFFE26, acia)
+    bus.register_device(0xFFFE30, 0xFFFE32, acia)
+    serial_setup = PrimarySerialSetup()
+    bus.register_device(0xFFFE28, 0xFFFE28, serial_setup)
     # HW.SER alias: console ACIA at $FFFFC8 (status) / $FFFFC9 (data)
     bus.register_device(0xFFFFC8, 0xFFFFC9, acia)
 
