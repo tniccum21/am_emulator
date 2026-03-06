@@ -22,6 +22,7 @@ from .devices.config_dip import ConfigDIP
 from .devices.sasi import SASIController
 from .devices.acia6850 import ACIA6850
 from .devices.timer6840 import Timer6840
+from .devices.rtc_msm5832 import RTC_MSM5832
 from .storage.disk_image import DiskImage
 from .storage.scsi_target import SCSITarget
 from .debug.trace import TraceLogger
@@ -46,6 +47,10 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     # Config DIP switch at $FE03 (absolute short → $FFFE03)
     dip = ConfigDIP(config.config_dip)
     bus.register_device(0xFFFE03, 0xFFFE03, dip)
+
+    # MSM5832 RTC at $FFFE04-$FFFE05
+    rtc = RTC_MSM5832()
+    bus.register_device(0xFFFE04, 0xFFFE05, rtc)
 
     # MC6840 PTM timer at $FFFE10-$FFFE1F (odd byte addresses)
     timer = Timer6840()
@@ -190,6 +195,21 @@ def run(config: SystemConfig) -> None:
     sys.stderr.write(
         f"  Instructions: {instruction_count}  Cycles: {cpu.cycles}\n"
     )
+
+    # Dump memory around final PC for debugging
+    pc = cpu.pc
+    sys.stderr.write(f"\n  Memory around PC=${pc:06X}:\n")
+    for base in range(pc - 16, pc + 32, 16):
+        words = []
+        for off in range(0, 16, 2):
+            addr = base + off
+            try:
+                w = bus.read_word(addr)
+            except Exception:
+                w = 0xDEAD
+            words.append(f"{w:04X}")
+        marker = " <-- PC" if base <= pc < base + 16 else ""
+        sys.stderr.write(f"    ${base:06X}: {' '.join(words)}{marker}\n")
 
 
 def _interactive_break(cpu: MC68010) -> None:
