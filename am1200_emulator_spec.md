@@ -6,6 +6,15 @@
 **Target Hardware:** Alpha Microsystems AM-1200 (DWL-00177-00 Rev B03)  
 **Target OS:** AMOS (Alpha Micro Operating System)
 
+Important 2026-03-07 note:
+
+- The serial mapping in section 2.5 is not fully settled.
+- Current hardware review and native-boot traces show that the ROM self-test
+  path uses `0xFFFE20`, `0xFFFE24`, `0xFFFE30`, and `0xFFFE28`, while a later
+  low-memory `AMOSL.MON` path uses `0xFFFFC8/0xFFFFC9`.
+- Do not assume `0xFFFFC8/0xFFFFC9` is simply the same `6850` as port 0.
+- See `docs/BOOT-SERIAL-FINDINGS.md` for the current evidence and caveats.
+
 ---
 
 ## 1. Project Overview
@@ -165,12 +174,24 @@ All I/O is memory-mapped. Addresses are byte-accessible (8-bit I/O data bus). De
 |-------------|---------|-----|------------------------------------------|
 | $00FE00     | HW.LED  | W   | Front panel 7-segment LED display        |
 | $00FE03     | HW.CFG  | R/W | Configuration DIP switch / control latch |
-| $00FFC8     | HW.SER  | R/W | Primary serial port (console, 6850 ACIA) |
+| $00FFC8     | HW.SER? | R/W | Provisional low-memory serial/interface path used by `AMOSL.MON`; exact decode still unresolved |
 | $00FF88     | HW.MCA  | R/W | Multi-comm controller base               |
 
 #### 2.5.2 Serial Ports — Primary (6850 ACIAs, schematic sheet 7)
 
-Three 6850 ACIA chips provide ports 0–2. Each ACIA has a 2-register interface: status/control at base, data at base+2. Baud rate generators are BR1941-8 (AM-1200) / BR1941-5 (AM-1000) with 4.9152MHz crystals.
+Three 6850 ACIA chips provide ports 0–2. Each ACIA has a 2-register interface:
+status/control at base, data at base+2. Baud rate generators are BR1941-8
+(AM-1200) / BR1941-5 (AM-1000) with 4.9152MHz crystals.
+
+Current confidence level:
+
+- High confidence: the ROM self-test `LED=5B` path uses the main port block at
+  `0xFFFE20`, `0xFFFE24`, and `0xFFFE30`.
+- High confidence: `0xFFFE28` is part of that self-test setup path.
+- Low confidence: `0xFFFFC8/0xFFFFC9` being a simple alias of port 0.
+- The AM-1200 sheet-3 decode includes separate split-interface signals
+  (`SCMDWR*`, `SSTATRD*`, `SDATWR*`, `SDATRD*`, `ESIOCSR*`) that may back the
+  low-memory monitor path instead.
 
 | Address     | Port | Register                  |
 |-------------|------|---------------------------|
