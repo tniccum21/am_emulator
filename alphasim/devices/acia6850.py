@@ -273,9 +273,13 @@ class ACIA6850(IODevice):
 
         elif reg_type == "data":
             # Transmit data — double-buffered TX
+            is_hw_ser_alias = 0xFFFFC8 <= (address & 0xFFFFFF) <= 0xFFFFC9
             self._tx_output[port].append(value)
             self._trace(f"Port {port} TX: ${value:02X} ({chr(value) if 0x20 <= value < 0x7F else '?'})")
-            if self.tx_callback:
+            # The low-memory HW.SER path is still only a provisional interface
+            # model. Do not surface it to host-facing console callbacks as
+            # confirmed terminal output.
+            if self.tx_callback and not is_hw_ser_alias:
                 self.tx_callback(port, value)
 
             if not self._tsr_active[port]:
