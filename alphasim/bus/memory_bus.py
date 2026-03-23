@@ -10,6 +10,13 @@ Word write: phys[addr] = cpu_low_byte, phys[addr+1] = cpu_high_byte
 Byte read:  CPU gets phys[addr] directly                 (no swap)
 Byte write: phys[addr] = value directly                  (no swap)
 
+The byte-swap applies ONLY to word/long bus cycles.  Byte-sized accesses
+go directly to physical memory with no swap.  This is by design for
+PDP-11 compatibility: byte 0 of a word is at the even (lower) address
+in physical memory, matching PDP-11 byte order.  The CPU sees:
+  - Byte read at even addr = phys[addr] = low byte of word (PDP-11 byte 0)
+  - Byte read at odd addr  = phys[addr] = high byte of word (PDP-11 byte 1)
+
 Devices store and return raw physical bytes.  The bus applies the
 word-level swap for .W and .L accesses only.
 """
@@ -20,6 +27,17 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..devices.base import IODevice
+
+
+class BusError(Exception):
+    """Raised when CPU accesses an unmapped address."""
+
+    def __init__(self, address: int, is_write: bool):
+        self.address = address
+        self.is_write = is_write
+        super().__init__(
+            f"Bus error {'write' if is_write else 'read'} at ${address:06X}"
+        )
 
 
 class MemoryBus:
@@ -43,6 +61,10 @@ class MemoryBus:
         # so the CPU can read SSP and PC vectors from ROM.
         # Disables after both vectors are read (8 bytes) or on any write.
         self._phantom_active: bool = False
+
+        # Bus error generation: disabled during exception frame pushes
+        # to prevent double-fault infinite recursion.
+        self.bus_error_enabled: bool = True
 
     # ── Device registration ──────────────────────────────────────────
 
@@ -103,10 +125,15 @@ class MemoryBus:
             return self._rom.read(address, 1) if self._rom else 0xFF
 
         # RAM: $000000–(ram_size-1)
-        if self._ram is not None:
+        if self._ram is not None and address < self._ram.size:
             return self._ram.read(address, 1)
 
-        # Unmapped
+        # Unmapped — return $FF (open bus).
+        # The AM-1200 address decode logic returns $FF for unmapped reads
+        # without asserting BERR.  The ROM checksum scan at $F9CA reads
+        # past ROM end ($804000+) and expects $FF, not a bus error.
+        # Memory sizing PATH 1 also relies on write/read-back to detect
+        # RAM size rather than bus errors.
         return 0xFF
 
     def _write_byte_physical(self, address: int, value: int) -> None:
@@ -126,11 +153,14 @@ class MemoryBus:
             return
 
         # RAM
-        if self._ram is not None:
+        if self._ram is not None and address < self._ram.size:
             self._ram.write(address, 1, value & 0xFF)
             return
 
-        # Unmapped — silently ignored
+        # Unmapped writes silently ignored (open bus).
+        # The AM-1200 memory sizing PATH 1 writes test patterns to
+        # addresses beyond RAM size and reads them back; bus errors
+        # would crash the generic handler at $0AFA.
 
     # ── CPU-facing access (with word-swap) ───────────────────────────
 
@@ -176,6 +206,21 @@ class MemoryBus:
         address &= ~1  # ensure even alignment
         self.write_word(address, (value >> 16) & 0xFFFF)
         self.write_word(address + 2, value & 0xFFFF)
+
+    # ── DMA access (raw physical, no CPU byte-swap) ──────────────────
+
+    def dma_read_byte(self, address: int) -> int:
+        """DMA byte read — raw physical access, no byte-swap.
+
+        DMA controllers operate on the system bus, not through the CPU's
+        byte-lane swap hardware.  Use this for SCSI DMA and any other
+        bus-mastering device transfers.
+        """
+        return self._read_byte_physical(address)
+
+    def dma_write_byte(self, address: int, value: int) -> None:
+        """DMA byte write — raw physical access, no byte-swap."""
+        self._write_byte_physical(address, value)
 
     # ── Device ticking ───────────────────────────────────────────────
 

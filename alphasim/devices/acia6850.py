@@ -2,16 +2,14 @@
 
 Three ACIA chips provide serial ports 0-2:
     Port 0 (console): $FFFE20 (status/control), $FFFE22 (data)
-                       Also accessible at $FFFFC8/$FFFFC9 (HW.SER alias)
     Port 1:           $FFFE24 (status/control), $FFFE26 (data)
     Port 2:           $FFFE30 (status/control), $FFFE32 (data)
 
 Main ACIA ports ($FFFE20-$FFFE32) are on the upper data bus (D8-D15),
 so registers appear at EVEN byte addresses with A1 as register select.
 
-HW.SER alias ($FFFFC8-$FFFFC9) uses A0 as register select:
-    $FFFFC8 (A0=0): status (read) / control (write)
-    $FFFFC9 (A0=1): receive data (read) / transmit data (write)
+Note: $FFFFC8-$FFFFC9 is the SCSI bus interface (see scsi_bus.py),
+NOT an ACIA alias as previously assumed.
 
 Status Register (read):
     Bit 0: RDRF -- Receive Data Register Full
@@ -48,10 +46,25 @@ from .base import IODevice
 # At 9600 baud, 10 bits/char, 8 MHz CPU: ~8333 cycles.
 TX_CHAR_CYCLES = 8000
 
-# Echo delay: round-trip time for terminal echo (TX time + RX time).
-# Terminal receives character after TX_CHAR_CYCLES, echoes it back,
-# echo arrives after another TX_CHAR_CYCLES.
-ECHO_DELAY_CYCLES = TX_CHAR_CYCLES * 2
+# Echo delay: cycles before TX data appears back in RX (terminal echo).
+# Must be short enough that terminal detect code sees the echo before
+# yielding.  The detect path executes ~200 instructions (~800 cycles)
+# between TX and RX check.  A small delay models a directly-connected
+# terminal with minimal wire propagation.
+ECHO_DELAY_CYCLES = 64
+
+# Auto-configure delay: after master reset, if no explicit config is
+# written within this many cycles, automatically configure with $15
+# (8N1, /16, RTS low).  This models the real-world scenario where the
+# ROM self-test or serial driver configures the ACIA shortly after
+# reset.  The delay must be long enough that the ROM self-test's own
+# $03/$15 sequence (which writes $15 within ~12 cycles) takes effect
+# normally, but short enough to trigger before the OS terminal detect
+# code gives up on finding a terminal.
+AUTO_CONFIG_DELAY = TX_CHAR_CYCLES * 4  # ~32K cycles
+
+# Standard operational config: 8N1, divide-by-16, RTS low, no IRQs.
+AUTO_CONFIG_VALUE = 0x15
 
 
 class ACIA6850(IODevice):
@@ -102,6 +115,12 @@ class ACIA6850(IODevice):
         # Transmit callback (called with port, byte when CPU sends data)
         self.tx_callback = None
 
+        # Auto-configure: when enabled, ports in master reset auto-transition
+        # to operational mode ($15) after AUTO_CONFIG_DELAY ticks.  This
+        # models the ROM self-test or serial driver configuring the ACIA.
+        self.auto_configure = True
+        self._auto_config_countdown = [0, 0, 0]
+
     def _trace(self, msg: str) -> None:
         if self._debug:
             print(f"[ACIA] {msg}", file=sys.stderr)
@@ -110,22 +129,12 @@ class ACIA6850(IODevice):
         """Map address to (port_number, 'status'|'data') or None.
 
         Main ACIA ports use A1 for register select (even addresses only).
-        HW.SER alias uses A0 for register select:
-            $FFFFC8 (A0=0) -> status/control
-            $FFFFC9 (A0=1) -> data
         """
-        # Main ACIA ports: even addresses, A1 selects register
         for port, (status_addr, data_addr) in self.PORT_MAP.items():
             if address == status_addr:
                 return (port, "status")
             if address == data_addr:
                 return (port, "data")
-        # HW.SER alias for console (port 0): A0 selects register
-        if 0xFFFFC8 <= address <= 0xFFFFC9:
-            if address & 1:  # A0=1 -> data register
-                return (0, "data")
-            else:            # A0=0 -> status register
-                return (0, "status")
         return None
 
     def _is_master_reset(self, port: int) -> bool:
@@ -260,8 +269,12 @@ class ACIA6850(IODevice):
                 self._echo_pending[port].clear()
                 self._rx_cooldown[port] = 0
                 self._trace(f"Port {port} master reset")
+                # Start auto-configure countdown
+                if self.auto_configure:
+                    self._auto_config_countdown[port] = AUTO_CONFIG_DELAY
             elif (old_cr & 0x03) == 0x03:
-                # Coming out of reset
+                # Coming out of reset — cancel any pending auto-configure
+                self._auto_config_countdown[port] = 0
                 self._trace(f"Port {port} control = ${value:02X}")
 
             # NOTE: Real MC6850 does NOT flush RX state on RX IRQ enable.
@@ -273,13 +286,9 @@ class ACIA6850(IODevice):
 
         elif reg_type == "data":
             # Transmit data — double-buffered TX
-            is_hw_ser_alias = 0xFFFFC8 <= (address & 0xFFFFFF) <= 0xFFFFC9
             self._tx_output[port].append(value)
             self._trace(f"Port {port} TX: ${value:02X} ({chr(value) if 0x20 <= value < 0x7F else '?'})")
-            # The low-memory HW.SER path is still only a provisional interface
-            # model. Do not surface it to host-facing console callbacks as
-            # confirmed terminal output.
-            if self.tx_callback and not is_hw_ser_alias:
+            if self.tx_callback:
                 self.tx_callback(port, value)
 
             if not self._tsr_active[port]:
@@ -293,8 +302,20 @@ class ACIA6850(IODevice):
                 self._tdre[port] = False  # TDR is full
 
     def tick(self, cycles: int) -> None:
-        """Advance transmit timing and deliver pending echoes."""
+        """Advance transmit timing, deliver echoes, and auto-configure."""
         for i in range(3):
+            # Auto-configure: if port is in master reset and countdown
+            # expires, transition to operational mode.
+            if self._auto_config_countdown[i] > 0:
+                self._auto_config_countdown[i] -= cycles
+                if self._auto_config_countdown[i] <= 0:
+                    self._auto_config_countdown[i] = 0
+                    if self._is_master_reset(i):
+                        self._control[i] = AUTO_CONFIG_VALUE
+                        self._trace(
+                            f"Port {i} auto-configured with "
+                            f"${AUTO_CONFIG_VALUE:02X}")
+
             # TSR shift register countdown
             if self._tsr_active[i]:
                 self._tsr_countdown[i] -= cycles

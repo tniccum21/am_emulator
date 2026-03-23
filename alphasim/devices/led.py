@@ -27,7 +27,7 @@ class LED(IODevice):
         self.value = value & 0xFF
         self.history.append(self.value)
         if self.stdout_mid_line:
-            sys.stdout.buffer.write(b"\r\n")
+            sys.stderr.buffer.write(b"\r\n")
             self.stdout_mid_line = False
-        sys.stdout.buffer.write(f"[LED] {self.value:02X}\r\n".encode())
-        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(f"[LED] {self.value:02X}\r\n".encode())
+        sys.stderr.buffer.flush()

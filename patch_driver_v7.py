@@ -1,1397 +1,1334 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Patch SCZ.DVR into AMOSL.MON v7 -- with disk I/O bypass.
+"""V1.4C native SCSI boot + Python disk I/O bypass → COMINT → SYSTEM.
 
-Changes from v6:
-  - Bypasses disk I/O at the OS level
-  - Monitors DDT+$84 (I/O status) via write hook
-  - When DDT+$84 becomes $FFFFFFFF (I/O pending):
-    a) Mount (no DDB): set success immediately
-    b) Read/Write (DDB present): handle from disk image directly
-  - Removes DDT from JOBCUR chain after handling
-  - Logs all disk I/O events for debugging
+Hybrid approach:
+1. Native SCSI bootstrap (real hardware path)
+2. After boot, fix MEMBAS/JCB/TCB
+3. Python $A03C intercept for runtime disk I/O
+4. Run SYSTEM to load modules
 """
+
+from __future__ import annotations
 import sys
-import os
-import shutil
-import select
-import tty
-import termios
-sys.path.insert(0, ".")
-
-INTERACTIVE = '--interactive' in sys.argv or '-i' in sys.argv
 from pathlib import Path
+from types import MethodType
+from collections import Counter
 
-src_path = Path("images/AMOS_1-3_Boot_OS.img")
-dst_path = Path("images/AMOS_1-3_Boot_OS_patched.img")
+sys.path.insert(0, "/Volumes/RAID0/repos/am_emulator")
+sys.path.insert(0, "/Volumes/RAID0/repos/Alpha-Python/lib")
 
-DRIVER_RAM = 0x7AC2
-MAX_COPY = 1432
-AMOSL_START_BLOCK = 3257
-BYTES_PER_BLOCK = 510
-
-CANTMR_DST = 0x9000
-CLRCDB_DST = 0x9050
-
-CORRUPT_START = 0x058E
-CORRUPT_END = 0x0596
-
-# DDT addresses
-DDT_ADDR = 0x7038
-DDT_QUEUE = DDT_ADDR + 0x78   # $70B0 — I/O DDB queue link
-DDT_SAVED_A6 = DDT_ADDR + 0x7C  # $70B4
-DDT_SAVED_SP = DDT_ADDR + 0x80  # $70B8
-DDT_STATUS = DDT_ADDR + 0x84  # $70BC — I/O status (0=done, $FFFFFFFF=pending)
-
-def read_word_le(data, offset):
-    return (data[offset+1] << 8) | data[offset]
-
-# Suppress boot output in interactive mode
-if INTERACTIVE:
-    _real_stdout = sys.stdout
-    sys.stdout = open(os.devnull, 'w')
-
-# ─── Step 1: Create disk patch ───
-print("Step 1: Creating disk patch...")
-with open(src_path, "rb") as f:
-    img = bytearray(f.read())
-
-# Keep the raw disk image for I/O bypass
-disk_image = img  # Reference to full image
-
-scz_data = bytearray()
-block = 1402
-while block != 0:
-    lba = block + 1
-    offset = lba * 512
-    link = read_word_le(img, offset)
-    scz_data.extend(img[offset+2:offset+512])
-    if link == 0:
-        break
-    block = link
-
-driver = scz_data[:MAX_COPY]
-print(f"  SCZ.DVR: {len(scz_data)} bytes, copying {len(driver)} bytes")
-
-shutil.copy2(src_path, dst_path)
-with open(dst_path, "r+b") as f:
-    patched = bytearray(f.read())
-    file_off = DRIVER_RAM
-    blk_idx = file_off // BYTES_PER_BLOCK
-    data_off = file_off % BYTES_PER_BLOCK
-    drv_pos = 0
-    remaining = len(driver)
-    while remaining > 0:
-        lba = AMOSL_START_BLOCK + blk_idx + 1
-        disk_offset = lba * 512
-        space = BYTES_PER_BLOCK - data_off
-        count = min(remaining, space)
-        disk_pos = disk_offset + 2 + data_off
-        patched[disk_pos:disk_pos + count] = driver[drv_pos:drv_pos + count]
-        drv_pos += count
-        remaining -= count
-        blk_idx += 1
-        data_off = 0
-    f.seek(0)
-    f.write(patched)
-
-print(f"  Disk patch saved: {dst_path}")
-
-# ─── Step 2: Boot to $006C0E ───
-print(f"\nStep 2: Booting to port init ($006C0E)...")
-
+from Alpha_Disk_Lib import AlphaDisk
 from alphasim.config import SystemConfig
+from alphasim.cpu.disassemble import disassemble_one
+from alphasim.devices.sasi import SASIController
 from alphasim.main import build_system
 
+REPO_ROOT = Path("/Volumes/RAID0/repos/am_emulator")
+ROM_EVEN = REPO_ROOT / "roms" / "AM-178-01-B05.BIN"
+ROM_ODD = REPO_ROOT / "roms" / "AM-178-00-B05.BIN"
+BOOT_IMAGE = REPO_ROOT / "images" / "HD0-V1.4C-Bootable-on-1400.img"
+
 config = SystemConfig(
-    rom_even_path=Path("roms/AM-178-01-B05.BIN"),
-    rom_odd_path=Path("roms/AM-178-00-B05.BIN"),
-    ram_size=0x400000,
+    rom_even_path=ROM_EVEN,
+    rom_odd_path=ROM_ODD,
+    ram_size=0x100000,
     config_dip=0x0A,
-    disk_image_path=dst_path,
+    disk_image_path=BOOT_IMAGE,
     trace_enabled=False,
-    max_instructions=50_000_000,
+    max_instructions=6_000_000,
     breakpoints=[],
 )
 
 cpu, bus, led, acia = build_system(config)
-acia_output = []
-banner_chars = bytearray()
-
-def _tx_cb(port, val):
-    ch = val & 0x7F
-    acia_output.append(ch)
-    if ch >= 0x20 or ch in (0x0A, 0x0D):
-        sys.stdout.buffer.write(bytes([ch]))
-        sys.stdout.buffer.flush()
-acia.tx_callback = _tx_cb
-
-def read_long(addr):
-    return (bus.read_word(addr) << 16) | bus.read_word(addr + 2)
-
-orig_write_byte = bus._write_byte_physical
-skip_hook = False
-
-def raw_write_word(addr, val):
-    addr &= ~1
-    orig_write_byte(addr, val & 0xFF)
-    orig_write_byte(addr + 1, (val >> 8) & 0xFF)
-
-def raw_write_long(addr, val):
-    addr &= ~1
-    raw_write_word(addr, (val >> 16) & 0xFFFF)
-    raw_write_word(addr + 2, val & 0xFFFF)
-
-# ─── Write hook: MEMBAS + JOBCUR protection + DDT+$84 monitoring ───
-# AMOSL.MON code+data extends to ~$87DA. $5252 JCB fill starts at ~$87DC.
-# Layout:
-#   $8800-$91FF: reserved for init job stack (2.5KB, SP starts at $9200, grows DOWN)
-#   $9200-$93FF: gap (exception frame is copied to SP, must not overlap MEMBAS)
-#   $9400+: free memory pool (MEMBAS)
-CORRECT_MEMBAS = 0x9400
-INIT_JOB_SP = 0x9200
-mem_patch_done = False
-write_043B_count = 0
-ddt84_dirty = False
-disk_io_count = 0
-job_port_addr = 0  # Set after boot
-disk_io_enabled = False  # Gate: only handle disk I/O after terminal init
-ddt00_monitor_count = [0]  # mutable counter for write hook
-ddt84_write_log_count = [0]  # mutable counter for DDT+$84 write log
-
-def combined_write_hook(address, value):
-    global mem_patch_done, write_043B_count, skip_hook
-    global ddt84_dirty, job_port_addr
-    addr = address & 0xFFFFFF
-    if skip_hook:
-        orig_write_byte(address, value)
-        return
-    orig_write_byte(address, value)
-
-    # MEMBAS hook (during boot)
-    if not mem_patch_done and addr == 0x043B and count > 10000:
-        write_043B_count += 1
-        if write_043B_count >= 2:
-            mem_patch_done = True
-            skip_hook = True
-            raw_write_long(0x0430, CORRECT_MEMBAS)
-            raw_write_long(0x0438, 0x3F0000)
-            raw_write_word(0x0426, 4)
-            raw_write_long(CORRECT_MEMBAS, 0)
-            raw_write_long(CORRECT_MEMBAS + 4, 0x3F0000 - CORRECT_MEMBAS)
-            skip_hook = False
-            # Verify the write stuck
-            v0 = read_long(CORRECT_MEMBAS)
-            v4 = read_long(CORRECT_MEMBAS + 4)
-            print(f"    MEMBAS hook fired: set ${CORRECT_MEMBAS:06X}")
-            print(f"    Verify: [{CORRECT_MEMBAS:06X}]=${v0:08X} [{CORRECT_MEMBAS+4:06X}]=${v4:08X}")
-            print(f"    MEMBAS($0430)=${read_long(0x0430):08X} MEMEND($0438)=${read_long(0x0438):08X}")
-
-    # JOBCUR protection (prevent OS from zeroing $041C or setting it to DDT)
-    if addr in (0x041C, 0x041D, 0x041E, 0x041F) and job_port_addr != 0:
-        new_jobcur = read_long(0x041C)
-        if new_jobcur == 0 or new_jobcur == DDT_ADDR:
-            skip_hook = True
-            raw_write_long(0x041C, job_port_addr)
-            skip_hook = False
-
-    # DDT+$84 write detection ($7038+$84 = $70BC-$70BF) — handle I/O immediately
-    if 0x70BC <= addr <= 0x70BF:
-        ddt84_dirty = True
-        if disk_io_enabled:
-            val_after = read_long(0x70BC)
-            if val_after == 0xFFFFFFFF:
-                # I/O request detected — handle immediately from disk image
-                handle_pending_disk_io()
-
-    # DDT+$78 write protection ($7038+$78 = $70B0-$70B3) — prevent scheduler queue
-    if 0x70B0 <= addr <= 0x70B3 and disk_io_enabled:
-        val_after = read_long(0x70B0)
-        if val_after != 0:
-            # DDT being linked into scheduler queue — unlink immediately
-            skip_hook = True
-            raw_write_long(0x70B0, 0)
-            skip_hook = False
-
-    # Monitor DDT+$00 writes ($7038-$7039) to catch resets
-    if addr in (0x7038, 0x7039) and disk_io_enabled:
-        w = (bus._read_byte_physical(0x7039) << 8) | bus._read_byte_physical(0x7038)
-        if not INTERACTIVE and ddt00_monitor_count[0] < 20:
-            ddt00_monitor_count[0] += 1
-            print(f"  [DDT+$00 WRITE] addr=${addr:06X} val=${value:02X} "
-                  f"word=${w:04X} PC=${cpu.pc:06X}")
-
-bus._write_byte_physical = combined_write_hook
+sasi = next(device for _, _, device in bus._devices if isinstance(device, SASIController))
 cpu.reset()
 
-count = 0
-while not cpu.halted and count < config.max_instructions:
-    if cpu.pc == 0x006C0E and count > 100000:
-        break
-    cpu.step()
-    bus.tick(1)
-    count += 1
+# Load disk image for Python I/O bypass
+with open(BOOT_IMAGE, "rb") as f:
+    disk_image = f.read()
 
-print(f"  Port init at instr {count}, PC=${cpu.pc:06X}")
-print(f"  $041C (job ptr): ${read_long(0x041C):08X}")
+orig_acia_irq = acia.get_interrupt_level
+acia_irq_disabled = False
+def no_acia_irq(self) -> int:
+    if acia_irq_disabled:
+        return 0
+    return orig_acia_irq()
+acia.get_interrupt_level = MethodType(no_acia_irq, acia)
 
-w2 = bus.read_word(DRIVER_RAM + 2)
-print(f"  Driver at ${DRIVER_RAM:06X}+2: ${w2:04X} ({'present' if w2 != 0 else 'MISSING'})")
+# ─── Constants ───
+# TCB and DDB I/O buffer at safe low addresses (below boot structures)
+# Boot structures observed: JCB at ~$9168, ZSYDSK DDB at ~$9D3A
+# TCB at $7000 is safely below anything the boot code uses
+TCB_ADDR = 0x7000
+TCB_BUF_ADDR = 0x7090
+TCB_BUF_SIZE = 64
+DDB_BUF_ADDR = 0x70D0  # 512-byte I/O buffer
+COMINT_ENTRY = 0x682E
 
-# ─── Step 3: Repair corrupted bytes ───
-print(f"\nStep 3: Repairing boot-corrupted bytes...")
-for off in range(CORRUPT_START, CORRUPT_END + 2, 2):
-    ram_addr = DRIVER_RAM + off
-    scz_w = read_word_le(scz_data, off)
-    ram_w = bus.read_word(ram_addr)
-    if scz_w != ram_w:
-        bus.write_word(ram_addr, scz_w)
-        print(f"  ${ram_addr:06X} (+${off:04X}): ${ram_w:04X} -> ${scz_w:04X}")
+# Disk I/O constants
+ZSYDSK_ADDR = 0x040C  # System disk DDB pointer
 
-# ─── Step 4: Inject CANTMR and CLRCDB ───
-print(f"\nStep 4: Injecting CANTMR and CLRCDB...")
-CANTMR_SRC = 0x05C8
-CANTMR_SIZE = 0x0616 - 0x05C8 + 2
-cantmr_data = scz_data[CANTMR_SRC:CANTMR_SRC + CANTMR_SIZE]
-for i in range(0, CANTMR_SIZE, 2):
-    w = (cantmr_data[i+1] << 8) | cantmr_data[i]
-    bus.write_word(CANTMR_DST + i, w)
+def read_word_disk(data, offset):
+    """Read word from disk image in physical byte order.
 
-CLRCDB_SRC = 0x0618
-CLRCDB_SIZE = 0x0628 - 0x0618 + 2
-clrcdb_data = scz_data[CLRCDB_SRC:CLRCDB_SRC + CLRCDB_SIZE]
-for i in range(0, CLRCDB_SIZE, 2):
-    w = (clrcdb_data[i+1] << 8) | clrcdb_data[i]
-    bus.write_word(CLRCDB_DST + i, w)
+    The emulator bus does word-level byte-swap on all reads/writes:
+        CPU word = (phys[addr+1] << 8) | phys[addr]
+    The disk image stores data in physical byte order (swapped vs CPU).
+    This function reads in the same swapped order so that bus.write_word
+    will store it correctly in physical memory.
+    """
+    return (data[offset+1] << 8) | data[offset]
 
-print(f"  CANTMR: {CANTMR_SIZE} bytes at ${CANTMR_DST:06X}")
-print(f"  CLRCDB: {CLRCDB_SIZE} bytes at ${CLRCDB_DST:06X}")
+step = 0
+last_led = -1
+last_pc = -1
+stuck_count = 0
+boot_complete = False
+sysvar_fixed = False
+comint_started = False
+bypass_counts = Counter()
+disk_a03c_just_skipped = False  # For skipping post-I/O $A03E yields
+ddb_setup_done = False
 
-# ─── Step 5: Patch JSR(PC) displacements ───
-print(f"\nStep 5: Patching JSR(PC) displacements...")
-jsr_patches = [
-    (0x0204, CANTMR_DST, "CANTMR (SELECT)"),
-    (0x03B0, CLRCDB_DST, "CLRCDB (ERRHND)"),
-    (0x040A, CLRCDB_DST, "CLRCDB (RQSENS)"),
-    (0x043C, CLRCDB_DST, "CLRCDB (TSTUNIT)"),
-    (0x046C, CLRCDB_DST, "CLRCDB (FORMAT)"),
-    (0x0490, CLRCDB_DST, "CLRCDB (FMTTST)"),
-    (0x057C, CLRCDB_DST, "CLRCDB (FMTLOP)"),
-    (0x0592, CLRCDB_DST, "CLRCDB (FMTLOP2)"),
-]
-for drv_off, target, desc in jsr_patches:
-    ram_addr = DRIVER_RAM + drv_off
-    disp_addr = ram_addr + 2
-    opcode = bus.read_word(ram_addr)
-    if opcode != 0x4EBA:
-        print(f"  ERROR: Expected $4EBA at ${ram_addr:06X}, got ${opcode:04X}")
-        continue
-    old_disp = bus.read_word(disp_addr)
-    new_disp = (target - disp_addr) & 0xFFFF
-    bus.write_word(disp_addr, new_disp)
-    print(f"  ${ram_addr:06X} (+${drv_off:04X}): -> ${target:06X} {desc}")
+INIT_JCB = None
+cmd_index = 0
+input_injected = False
+ini_data_pending = False
+output_chars = []  # Capture all terminal output chars
 
-# ─── Step 5b: Inject trap-door driver at DDT+$08 ───
-print(f"\nStep 5b: Setting up trap-door driver...")
-TRAPDOOR_ADDR = 0x9100
-
-# Write a small 68000 routine at $9100:
-#   $9100: NOP        ($4E71) — marker for Python intercept
-#   $9102: RTS        ($4E75) — return to caller
-bus.write_word(TRAPDOOR_ADDR, 0x4E71)      # NOP
-bus.write_word(TRAPDOOR_ADDR + 2, 0x4E75)  # RTS
-
-# DDT+$08 through DDT+$0D overlap with JCB fields that the OS reads
-# (e.g., JCB+$08 is used by memory module validation code at $37xx).
-# Previously we injected JMP $9100 here for a trap-door driver, but since
-# we handle disk I/O synchronously via LINE-A intercept, the trap-door
-# is never called. Zero these fields to prevent JCB field corruption.
-DDT_XFR = DDT_ADDR + 0x08  # $7040
-bus.write_word(DDT_XFR, 0x0000)
-bus.write_word(DDT_XFR + 2, 0x0000)
-bus.write_word(DDT_XFR + 4, 0x0000)
-print(f"  DDT+$08 at ${DDT_XFR:06X}: ZEROED (no trap-door driver needed)")
-# JCB+$0C is the job's memory module pointer, read by $A052.
-# Must point to a valid memory block (even addr, within RAM, first long=0
-# for empty block). Use $90F0 as a dummy empty module.
-DUMMY_MODULE = 0x90F0
-raw_write_long(DUMMY_MODULE, 0)       # next = 0 (empty)
-raw_write_long(DUMMY_MODULE + 4, 0)   # size = 0
-raw_write_long(DDT_ADDR + 0x0C, DUMMY_MODULE)
-print(f"  DDT+$0C at ${DDT_ADDR + 0x0C:06X}: -> ${DUMMY_MODULE:06X} (dummy module)")
-
-# ─── Step 6: JOBCUR fix and pending I/O ───
-print(f"\nStep 6: JOBCUR fix and pending I/O...")
-
-raw_jobcur = read_long(0x041C)
-print(f"  JOBCUR at $041C = ${raw_jobcur:08X}")
-ddt84_val = read_long(DDT_STATUS)
-print(f"  DDT+$84 = ${ddt84_val:08X}")
-print(f"  DDT+$78 = ${read_long(DDT_QUEUE):08X}")
-print(f"  DDT+$80 = ${read_long(DDT_SAVED_SP):08X}")
-
-# Find real JCB from JOBTBL ($0418)
-jobtbl = read_long(0x0418) & 0xFFFFFF
-print(f"  JOBTBL at $0418 = ${jobtbl:06X}")
-if jobtbl != 0 and jobtbl < 0x400000:
-    jcb0 = read_long(jobtbl) & 0xFFFFFF  # Job #0 = init job
-    print(f"  JCB #0 (init job) = ${jcb0:06X}")
-    # Also check a few more job slots
-    for i in range(4):
-        j = read_long(jobtbl + i * 4) & 0xFFFFFF
-        if j != 0:
-            print(f"  JCB #{i} = ${j:06X}")
+# Read commands from piped stdin, or fall back to VER
+if not sys.stdin.isatty():
+    _raw = sys.stdin.buffer.read()
+    test_commands = [line + b'\x0A' for line in _raw.split(b'\n') if line.strip()]
 else:
-    jcb0 = 0
+    test_commands = [b"VER\x0A"]
+_last_rom_pc = 0
 
-# JOBCUR=$7038 is actually the init job JCB (=DDT) — accept it
-job_port_addr = raw_jobcur
-ddt84_dirty = False  # Will handle pending I/O after function defs
+# ─── Module loading ───
+MODULE_BASE = 0x20000  # Well above boot structures, below MEMBAS
+SYSMSG_BASE = 0x28000  # SYSMSG.USA loaded here
+SYSDATA_ADDR = 0x29000  # Zeroed block for JCB+$D0 (system data area)
+sysmsg_loaded = False
+sysmsg_block_addr = 0  # Address of SYSMSG raw data (for message lookup intercept)
+module_entries = {}  # Maps desc_base_addr → code_entry_addr for dispatch intercept
+cmdlin_desc_addr = 0  # Descriptor address of CMDLIN.SYS for FIND intercept
+CMDLIN_DATA_ADDR = 0x029200  # Separate data area for CMDLIN (NOT inside module code!)
+CMDLIN_DATA_SIZE = 0x0800   # 2KB data area
+INIT_SENTINEL = 0x090000    # Return address sentinel for init sub-execution
+cmdlin_init_phase = False   # True while running CMDLIN init code
+cmdlin_init_saved = None    # Saved CPU state during init
+last_find_rad50 = 0         # RAD50 command name from last FIND CMD intercept
+last_cmd_line = b''         # Full command line text from last TTYLIN injection
 
-# ─── Step 6b: Analyze $A03E kernel handler ───
-print(f"\nStep 6b: $A03E kernel handler analysis...")
-# Find LINE-A dispatch table
-move_ext_6b = bus.read_word(0x070C)
-disp_byte_6b = move_ext_6b & 0xFF
-table_base_6b = 0x070C + disp_byte_6b
-handler_3e_addr_6b = bus.read_word(table_base_6b + 0x03E)
-handler_3c_addr_6b = bus.read_word(table_base_6b + 0x03C)
-print(f"  LINE-A table base: ${table_base_6b:06X}")
-print(f"  $A03C handler: ${handler_3c_addr_6b:06X}")
-print(f"  $A03E handler: ${handler_3e_addr_6b:06X}")
+def rad50_encode(s):
+    chars = " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.%0123456789"
+    s = s.upper().ljust(3)
+    return chars.index(s[0]) * 1600 + chars.index(s[1]) * 40 + chars.index(s[2])
 
-print(f"  (handler disassembly skipped for brevity)")
+def to_cpu_word(data, off):
+    """Read word from raw disk data in CPU byte order (same as read_word_disk)."""
+    return (data[off+1] << 8) | data[off]
 
-# ─── Disk I/O bypass functions ───
+def load_sys_modules():
+    """Load .SYS modules from disk and build SRCH module chain in memory.
 
-def remove_ddt_from_jobcur_chain():
-    """Remove DDT $7038 from the JOBCUR scheduling chain at $03A4+$78."""
-    global skip_hook
-    skip_hook = True
-    prev = 0x03A4
-    safety = 0
-    while safety < 50:
-        safety += 1
-        next_entry = read_long(prev + 0x78) & 0xFFFFFF
-        if next_entry == 0:
-            break
-        if next_entry == DDT_ADDR:
-            our_next = read_long(DDT_ADDR + 0x78) & 0xFFFFFF
-            raw_write_long(prev + 0x78, our_next)
-            raw_write_long(DDT_ADDR + 0x78, 0)
-            break
-        prev = next_entry
-        if prev >= 0x400000:
-            break
-    skip_hook = False
+    Module chain format:
+      +$00: LONG relative link (offset to next module, 0 = end)
+      +$04: WORD type
+      +$06: 6 bytes RAD50 name (filename + extension)
+      +$0C: module descriptor (from file+$04 onwards)
 
-def find_ddb_for_ddt():
-    """Walk DDB chain from $0408 to find a DDB referencing DDT $7038."""
-    ddb = read_long(0x0408) & 0xFFFFFF
+    The $5A9C command dispatcher checks desc+$28 to determine if the module
+    is initialized. We zero desc+$24 and desc+$28 to force the init path.
+    """
+    amos_disk = AlphaDisk(str(BOOT_IMAGE))
+    dev = amos_disk.get_logical_device(0)
+
+    modules_to_load = [
+        ("CMDLIN", "SYS"),
+        ("SCNWLD", "SYS"),
+        ("DCACHE", "SYS"),
+        ("SCZ190", "SYS"),
+        ("SCZRR",  "SYS"),
+    ]
+
+    loaded = []
+    addr = MODULE_BASE
+    for name, ext in modules_to_load:
+        data = dev.read_file_contents((1, 4), name, ext)
+        if not data or len(data) < 6:
+            print(f"  Module {name}.{ext}: NOT FOUND", flush=True, file=sys.stderr)
+            continue
+
+        # Verify $FFFF marker
+        marker = to_cpu_word(data, 0)
+        if marker != 0xFFFF:
+            print(f"  Module {name}.{ext}: bad marker ${marker:04X}", flush=True, file=sys.stderr)
+            continue
+
+        # Type from file +$02
+        typ = to_cpu_word(data, 2)
+
+        # Module chain header
+        bus.write_long(addr + 0x00, 0)  # Link (set later)
+        bus.write_word(addr + 0x04, typ)
+
+        # RAD50 name
+        name_padded = name.ljust(6)
+        bus.write_word(addr + 0x06, rad50_encode(name_padded[0:3]))
+        bus.write_word(addr + 0x08, rad50_encode(name_padded[3:6]))
+        bus.write_word(addr + 0x0A, rad50_encode(ext.ljust(3)))
+
+        # Module descriptor: everything from file +$04 onwards
+        code_start = 4
+        code_len = len(data) - code_start
+        desc_base = addr + 0x0C
+        for i in range(0, code_len - 1, 2):
+            w = to_cpu_word(data, code_start + i)
+            bus.write_word(desc_base + i, w)
+        if code_len % 2:
+            bus.write_byte(desc_base + code_len - 1, data[code_start + code_len - 1])
+
+        # Calculate code entry address from the module header.
+        # desc+$08 contains the file offset to the code entry point.
+        # Code entry in memory = desc_base + (file_offset - 4).
+        # DO NOT overwrite desc+$24/desc+$28 — they overlap with code!
+        file_code_offset = to_cpu_word(data, 0x0C)  # file+$0C = desc+$08
+        code_entry = desc_base + (file_code_offset - 4)
+        module_entries[desc_base] = code_entry
+
+        total_size = (0x0C + code_len + 3) & ~3  # Align to long
+        loaded.append((addr, name, ext, total_size))
+        print(f"  Module {name}.{ext}: ${addr:06X} desc=${desc_base:06X} "
+              f"code=${code_entry:06X} ({total_size} bytes)", flush=True, file=sys.stderr)
+
+        # Track CMDLIN.SYS descriptor for FIND intercept
+        global cmdlin_desc_addr
+        if name == "CMDLIN" and ext == "SYS":
+            cmdlin_desc_addr = desc_base
+            # Show key descriptor fields for debugging
+            d00 = bus.read_word(desc_base)
+            d01 = bus.read_byte(desc_base + 1)
+            d08 = bus.read_word(desc_base + 8)
+            d24 = bus.read_long(desc_base + 0x24)
+            d28 = bus.read_long(desc_base + 0x28)
+            print(f"    CMDLIN desc: +$00=${d00:04X} +$01=${d01:02X}(bit6={d01>>6&1}) "
+                  f"+$08=${d08:04X} +$24=${d24:08X} +$28=${d28:08X}", flush=True, file=sys.stderr)
+
+        addr += total_size
+
+    # Set up links
+    for i in range(len(loaded) - 1):
+        cur_addr = loaded[i][0]
+        next_addr = loaded[i + 1][0]
+        bus.write_long(cur_addr, next_addr - cur_addr)
+    if loaded:
+        bus.write_long(loaded[-1][0], 0)  # End of chain
+
+    return MODULE_BASE if loaded else 0
+
+def load_sysmsg():
+    """Load SYSMSG.USA into memory as a system library block.
+
+    The AMOS FIND ($A06C) call searches for files in the memory-resident
+    library chain. We create a block at SYSMSG_BASE that looks like a
+    system library entry:
+      +$00: LONG link (0 = end)
+      +$04: WORD type ($8007 = system message file)
+      +$06: RAD50 name "SYSMSG.USA"
+      +$0C: LONG file size
+      +$10: raw SYSMSG.USA file data
+
+    The FIND intercept returns this block pointer. The message lookup
+    code at $78AE reads offsets relative to this pointer.
+    """
+    amos_disk = AlphaDisk(str(BOOT_IMAGE))
+    dev = amos_disk.get_logical_device(0)
+    data = dev.read_file_contents((1, 4), "SYSMSG", "USA")
+    if not data:
+        print("  SYSMSG.USA: NOT FOUND", flush=True, file=sys.stderr)
+        return 0
+
+    print(f"  SYSMSG.USA: {len(data)} bytes, loading at ${SYSMSG_BASE:06X}", flush=True, file=sys.stderr)
+
+    # Write raw file data directly at SYSMSG_BASE
+    # The bus uses word-level byte swap; disk data is in physical order.
+    # read_word_disk converts to CPU word order for bus.write_word.
+    base = SYSMSG_BASE
+    for i in range(0, len(data) - 1, 2):
+        w = (data[i+1] << 8) | data[i]  # CPU word order
+        bus.write_word(base + i, w)
+    if len(data) % 2:
+        bus.write_byte(base + len(data) - 1, data[-1])
+
+    # Verify: read back first few bytes to confirm "ALPHA MICRO "
+    verify = ""
+    for i in range(12):
+        b = bus.read_byte(base + i)
+        verify += chr(b) if 32 <= b < 127 else "."
+    print(f"  SYSMSG verify: '{verify}'", flush=True, file=sys.stderr)
+
+    # Also read the entry_size byte at +$0F
+    entry_sz = bus.read_byte(base + 0x0F)
+    print(f"  SYSMSG byte +$0F (entry size?): ${entry_sz:02X} ({entry_sz})", flush=True, file=sys.stderr)
+
+    # Read +$14 word (record count)
+    rec_count = bus.read_word(base + 0x14)
+    print(f"  SYSMSG word +$14 (record count): ${rec_count:04X} ({rec_count})", flush=True, file=sys.stderr)
+
+    return base
+
+def inject_input_to_tcb(data: bytes):
+    global input_injected, ini_data_pending
+    for i, ch in enumerate(data):
+        bus.write_byte(TCB_BUF_ADDR + i, ch)
+    bus.write_long(TCB_ADDR + 0x1E, TCB_BUF_ADDR)
+    bus.write_word(TCB_ADDR + 0x12, len(data))
+    bus.write_word(TCB_ADDR + 0x00, 0x0000)
+    input_injected = True
+    ini_data_pending = True
+
+def find_ddb_chain():
+    """Walk DDB chain from $0408 to find DDBs."""
+    ddb = bus.read_long(0x0408) & 0xFFFFFF
     found = []
     safety = 0
     while ddb != 0 and ddb < 0x400000 and safety < 20:
         safety += 1
-        ddb_ddt = read_long(ddb + 0x08) & 0xFFFFFF
-        if ddb_ddt == DDT_ADDR:
-            found.append(ddb)
-        ddb = read_long(ddb) & 0xFFFFFF
+        found.append(ddb)
+        ddb = bus.read_long(ddb) & 0xFFFFFF
     return found
 
-def handle_pending_disk_io():
-    """Handle a pending disk I/O operation on DDT $7038."""
-    global disk_io_count, skip_hook
-    disk_io_count += 1
+def do_disk_read(ddb_ptr):
+    """Read a disk block from the image into the DDB buffer.
 
-    # Dump full DDT state for debugging
-    if disk_io_count <= 5:
-        print(f"\n  DISK I/O #{disk_io_count}: DDT state dump:")
-        print(f"    PC=${cpu.pc:06X} SR=${cpu.sr:04X}")
-        for i in range(8):
-            print(f"    D{i}=${cpu.d[i]:08X}  A{i}=${cpu.a[i]:08X}")
-        print(f"    DDT ($7038) full dump:")
-        for off in range(0, 0x88, 4):
-            val = read_long(DDT_ADDR + off)
-            if val != 0:
-                print(f"      +${off:02X}: ${val:08X}")
+    I/O request DDB layout: +$0C=buffer, +$10=block number.
+    V1.4C partition offset = 0. AMOS block N = LBA N+1.
+    """
+    ddb_buffer = bus.read_long(ddb_ptr + 0x0C) & 0xFFFFFF
+    ddb_block = bus.read_long(ddb_ptr + 0x10)
 
-    # Walk DDB chain to find DDBs for our DDT
-    ddb_list = find_ddb_for_ddt()
-    if disk_io_count <= 5:
-        print(f"    DDB chain entries for DDT $7038: {[f'${d:06X}' for d in ddb_list]}")
-        for ddb in ddb_list:
-            print(f"    DDB at ${ddb:06X}:")
-            for off in range(0, 0x30, 4):
-                val = read_long(ddb + off)
-                if val != 0 or off in (0x00, 0x08, 0x0C, 0x10):
-                    print(f"      +${off:02X}: ${val:08X}")
-
-    if not ddb_list:
-        # No DDB queued — this is a mount or simple status command
-        print(f"\n  DISK I/O #{disk_io_count}: MOUNT (no DDB)")
-        skip_hook = True
-        raw_write_long(DDT_STATUS, 0)
-        skip_hook = False
-        # DON'T remove from chain — let scheduler handle naturally
-    else:
-        # Use first DDB found
-        ddb_ptr = ddb_list[0]
-
-        # DDB format (discovered from dump):
-        # +$00: link (long)
-        # +$04: hardware address (long) — same as DD.HWA
-        # +$08: DDT pointer (long)
-        # +$0C: buffer address (long)
-        # +$10: block number (long)
-        ddb_buffer = read_long(ddb_ptr + 0x0C) & 0xFFFFFF
-        ddb_block = read_long(ddb_ptr + 0x10)
-
-        # Partition offset from DD (driver descriptor at $7AC2)
-        partition_offset_raw = read_long(DRIVER_RAM + 0x14)
-
-        # For mount (block=0), skip partition offset — read disk label at LBA 0
-        # For reads (block>0), add partition offset
-        if ddb_block == 0:
-            partition_offset = 0
-        else:
-            partition_offset = partition_offset_raw & 0xFFFF
-
-        # Calculate LBA — AMOS block N maps to LBA N+1 (LBA 0 is boot sector)
-        lba = ddb_block + partition_offset + 1
-        byte_offset = lba * 512
-
-        if disk_io_count <= 10:
-            print(f"\n  DISK I/O #{disk_io_count}: DDB at ${ddb_ptr:06X}")
-            print(f"    Block=${ddb_block:08X} Buffer=${ddb_buffer:06X}")
-            print(f"    Partition offset=${partition_offset} LBA={lba} "
-                  f"(byte ${byte_offset:08X})")
-
-        if byte_offset >= 0 and byte_offset + 512 <= len(disk_image):
-            # Read 512 bytes from disk image into RAM buffer
-            for i in range(0, 512, 2):
-                w = read_word_le(disk_image, byte_offset + i)
-                bus.write_word(ddb_buffer + i, w)
-
-            if disk_io_count <= 5:
-                print(f"    READ OK: {512} bytes → ${ddb_buffer:06X}")
-                # Show first 16 words of data
-                data_preview = []
-                for j in range(0, 32, 2):
-                    w = bus.read_word(ddb_buffer + j)
-                    data_preview.append(f"${w:04X}")
-                print(f"    Data: {' '.join(data_preview[:8])}")
-                print(f"          {' '.join(data_preview[8:])}")
-        else:
-            print(f"    ERROR: LBA={lba} (offset ${byte_offset:08X}) out of range "
-                  f"(image={len(disk_image)} bytes)")
-
-        # Set success — DON'T remove from chain
-        skip_hook = True
-        raw_write_long(DDT_STATUS, 0)
-        skip_hook = False
-
-a03e_count = 0
-a03c_count = 0
-trapdoor_count = 0
-
-def do_disk_read(ddb_ptr, log_prefix=""):
-    """Read a disk block for the given DDB from the disk image."""
-    global skip_hook
-    ddb_buffer = read_long(ddb_ptr + 0x0C) & 0xFFFFFF
-    ddb_block = read_long(ddb_ptr + 0x10)
-
-    partition_offset_raw = read_long(DRIVER_RAM + 0x14)
-    partition_offset = partition_offset_raw & 0xFFFF if ddb_block > 0 else 0
-    # AMOS block N maps to LBA N+1 (LBA 0 is boot sector)
-    lba = ddb_block + partition_offset + 1
+    # V1.4C: partition offset = 0
+    lba = ddb_block + 1
     byte_offset = lba * 512
 
     if 0 <= byte_offset and byte_offset + 512 <= len(disk_image):
-        skip_hook = True
         for i in range(0, 512, 2):
-            w = read_word_le(disk_image, byte_offset + i)
+            w = read_word_disk(disk_image, byte_offset + i)
             bus.write_word(ddb_buffer + i, w)
 
-        # FIX: Block 0 is the disk label. Byte 0 = DK.FLG (disk flags).
-        # The image has $00 here but mount code checks TST.B (A4) where
-        # A4 = buffer address. Must be non-zero for mount to succeed.
-        # $0F = formatted + MFD + bitmap + accounts flags.
+        # Fix disk label byte 0 (V1.4C extended format has $00)
         if ddb_block == 0:
             b0 = bus.read_byte(ddb_buffer)
             if b0 == 0:
-                orig_write_byte(ddb_buffer, 0x0F)
-                if not INTERACTIVE and a03c_count <= 20:
-                    print(f"    ** Fixed label byte 0: $00 -> $0F at ${ddb_buffer:06X}")
+                bus.write_byte(ddb_buffer, 0x0F)
 
-        raw_write_long(DDT_STATUS, 0)
-        # Also clear DDT+$00 (device status word) — the $A03E handler
-        # checks this and yields while I/O pending bits are set.
-        # Since we did the I/O synchronously, mark device as idle.
-        raw_write_word(DDT_ADDR, 0)
-        skip_hook = False
         return (True, ddb_block, lba, ddb_buffer)
+    return (False, ddb_block, lba, ddb_buffer)
+
+def setup_ddb(ddb_addr):
+    """Set up a DDB with V1.4C disk parameters."""
+    bus.write_byte(ddb_addr, 0x0F)                # DK.FLG
+    bus.write_long(ddb_addr + 0x0C, 512)          # DK.BPS
+    bus.write_long(ddb_addr + 0x10, 32)           # DK.SPT
+    bus.write_long(ddb_addr + 0x14, 16)           # DK.SPC
+    bus.write_long(ddb_addr + 0x20, 1)            # DK.MFD
+    bus.write_long(ddb_addr + 0x24, 2)            # DK.BMP
+    bus.write_long(ddb_addr + 0x28, 0)            # DK.PAR
+    bus.write_long(ddb_addr + 0x2C, 61531)        # DK.SIZ
+    cur_buf = bus.read_long(ddb_addr + 0x7C) & 0xFFFFFF
+    if cur_buf == 0 or cur_buf > 0x3F0000:
+        bus.write_long(ddb_addr + 0x7C, DDB_BUF_ADDR)
+    print(f"    Setup DDB at ${ddb_addr:06X}: FLG=$0F MFD=1 BMP=2 SIZ=61531", flush=True, file=sys.stderr)
+
+
+def handle_a03c():
+    """Handle $A03C DSKIO LINE-A call.
+
+    Two modes based on D6:
+    - D6 >= 0: DDT-based "mount/start driver" request. A0 = DDT/JCB.
+      Native handler would set JOBCUR=A0, A0+$84=$FFFFFFFF, then the
+      disk driver ISR processes it. We simulate completion immediately.
+    - D6 < 0: DDB-based "queue I/O" request. A0 = DDB with buffer+block.
+    """
+    global disk_a03c_just_skipped
+    bypass_counts['a03c'] += 1
+
+    a0 = cpu.a[0] & 0xFFFFFF
+    d6_signed = cpu.d[6]
+    if d6_signed > 0x7FFFFFFF:
+        d6_signed -= 0x100000000
+    d6_byte = cpu.d[6] & 0xFF
+
+    if bypass_counts['a03c'] <= 30:
+        print(f"  $A03C #{bypass_counts['a03c']}: PC=${cpu.pc:06X} A0=${a0:06X} D6=${d6_byte:02X} (signed={d6_signed})", flush=True, file=sys.stderr)
+
+    if d6_signed >= 0:
+        # DDT-based mount/start request. A0 = DDT/JCB.
+        # Native handler would: JOBCUR=A0, A0+$84=$FFFFFFFF
+        # We simulate: set up DDB, set JOBCUR, mark I/O complete (+$84=0)
+        if bypass_counts['a03c'] <= 30:
+            print(f"    DDT mount request (D6>=0)", flush=True, file=sys.stderr)
+
+        # Set JOBCUR = A0 (what the native handler does)
+        bus.write_long(0x041C, a0)
+
+        # Find and set up the system DDB
+        # DDT+$04 typically points to the system DDB
+        ddt_ddb = bus.read_long(a0 + 0x04) & 0xFFFFFF
+        zsydsk = bus.read_long(ZSYDSK_ADDR) & 0xFFFFFF
+
+        if ddt_ddb > 0 and ddt_ddb < 0x400000:
+            setup_ddb(ddt_ddb)
+        if zsydsk > 0 and zsydsk < 0x400000 and zsydsk != ddt_ddb:
+            setup_ddb(zsydsk)
+
+        # Mark I/O as complete — DON'T set $FFFFFFFF (that's "pending")
+        bus.write_long(a0 + 0x84, 0)  # I/O complete
+        # Preserve JCB runnable bit and status
+        cur_status = bus.read_word(a0)
+        # Set runnable bit ($2000) so scheduler dispatches this job
+        bus.write_word(a0, cur_status | 0x2000)
+
+        if bypass_counts['a03c'] <= 30:
+            print(f"    JOBCUR=${a0:06X} +$84=0 (complete) status=${bus.read_word(a0):04X}", flush=True, file=sys.stderr)
+
     else:
-        return (False, ddb_block, lba, ddb_buffer)
-
-
-def handle_trapdoor_driver():
-    """Handle trap-door driver call at $9100 — the scheduler dispatched to us."""
-    global trapdoor_count, skip_hook
-    trapdoor_count += 1
-
-    if trapdoor_count <= 20:
-        print(f"\n  TRAPDOOR #{trapdoor_count}: PC=${cpu.pc:06X}")
-        print(f"    D0=${cpu.d[0]:08X} D1=${cpu.d[1]:08X} D2=${cpu.d[2]:08X}")
-        print(f"    A0=${cpu.a[0]:08X} A1=${cpu.a[1]:08X} A2=${cpu.a[2]:08X}")
-        print(f"    A4=${cpu.a[4]:08X} A5=${cpu.a[5]:08X} A6=${cpu.a[6]:08X}")
-
-    # Find pending DDBs for our DDT
-    ddb_list = find_ddb_for_ddt()
-    if trapdoor_count <= 20:
-        print(f"    DDBs: {len(ddb_list)}")
-
-    handled_any = False
-    for ddb_ptr in ddb_list:
-        ok, blk, lba, buf = do_disk_read(ddb_ptr)
-        if ok:
-            handled_any = True
-            if trapdoor_count <= 20:
-                preview = [f"${bus.read_word(buf + j):04X}" for j in range(0, 16, 2)]
-                print(f"    >> READ block={blk} LBA={lba} → ${buf:06X}")
-                print(f"       Data: {' '.join(preview)}")
-        else:
-            if trapdoor_count <= 20:
-                print(f"    >> OUT OF RANGE: block={blk} LBA={lba}")
-
-    if not handled_any:
-        # No DDBs or all out of range — set error
-        if trapdoor_count <= 20:
-            print(f"    >> No DDBs to handle, setting success anyway")
-        skip_hook = True
-        raw_write_long(DDT_STATUS, 0)
-        skip_hook = False
-
-    # Let the NOP+RTS at $9100 execute — will return to scheduler
-
-
-def handle_a03c_io():
-    """Handle $A03C LINE-A trap — queue I/O, handle immediately from disk image."""
-    global a03c_count
-    a03c_count += 1
-
-    ddb_list = find_ddb_for_ddt()
-    if a03c_count <= 20:
-        print(f"\n  $A03C #{a03c_count}: PC=${cpu.pc:06X} DDBs={len(ddb_list)}")
-        for ddb in ddb_list[:3]:
-            buf = read_long(ddb + 0x0C) & 0xFFFFFF
-            blk = read_long(ddb + 0x10)
-            print(f"    DDB ${ddb:06X}: block={blk} buf=${buf:06X}")
-
-    # Pre-handle I/O before kernel queues it
-    for ddb_ptr in ddb_list:
-        ok, blk, lba, buf = do_disk_read(ddb_ptr)
-        if ok and a03c_count <= 20:
-            print(f"    >> Pre-handled: block={blk} LBA={lba}")
-
-    # Let $A03C execute normally
-
-
-def handle_a03e_io():
-    """Handle $A03E LINE-A trap — let it execute normally now that driver exists."""
-    global a03e_count
-    a03e_count += 1
-
-    if a03e_count <= 10 or a03e_count in (50, 100, 500):
-        ddt_status = bus.read_word(DDT_ADDR)
-        io_stat = read_long(DDT_STATUS)
-        ddb_list = find_ddb_for_ddt()
-        print(f"\n  $A03E #{a03e_count}: DDT+$00=${ddt_status:04X} "
-              f"DDT+$84=${io_stat:08X} DDBs={len(ddb_list)}")
-
-    # Don't intercept — let kernel $A03E handler run
-    # It will OR D6 into DDT+$00 and call scheduler
-    # Scheduler should now dispatch to our trap-door driver at $9100
-
-    if a03e_count > 1000:
-        print(f"\n  $A03E LIMIT: {a03e_count} calls, stopping")
-        cpu.halted = True
-
-# ─── Step 6c: Handle pending I/O from boot ───
-print(f"\nStep 6c: Handling pending I/O from boot...")
-
-# Clear stale pending I/O from boot — DDT+$84=$FFFFFFFF was never serviced
-# because DDT+$08 was zero during boot. Now DDT+$08=JMP $9100.
-# Just clear the stale state so the OS can re-issue the request properly.
-ddt84_val = read_long(DDT_STATUS)
-if ddt84_val == 0xFFFFFFFF:
-    skip_hook = True
-    raw_write_long(DDT_STATUS, 0)
-    skip_hook = False
-    print(f"  Cleared stale DDT+$84 ($FFFFFFFF -> $00000000)")
-else:
-    print(f"  DDT+$84 = ${ddt84_val:08X} (not pending)")
-ddt84_dirty = False
-print(f"  JOBCUR = ${read_long(0x041C):08X}")
-print(f"  DDT+$84 = ${read_long(DDT_STATUS):08X}")
-
-# ─── Step 6d: Re-establish MEMBAS free chain ───
-# The early boot write hook sets MEMBAS at $8C00, but ROM's init code
-# fills RAM with $5252 pattern AFTER our hook, overwriting the free chain.
-# Re-write it here, right before the main loop.
-skip_hook = True
-raw_write_long(0x0430, CORRECT_MEMBAS)
-raw_write_long(0x0438, 0x3F0000)
-raw_write_long(CORRECT_MEMBAS, 0)                          # next = 0 (single block)
-raw_write_long(CORRECT_MEMBAS + 4, 0x3F0000 - CORRECT_MEMBAS)  # size of free block
-skip_hook = False
-mb_next = read_long(CORRECT_MEMBAS)
-mb_size = read_long(CORRECT_MEMBAS + 4)
-print(f"\nStep 6d: Re-established MEMBAS at ${CORRECT_MEMBAS:06X}")
-print(f"  chain: next=${mb_next:08X} size=${mb_size:08X}")
-
-# ─── Step 6e: Create terminal control block ───
-# The init job JCB IS the DDT at $7038. DDT+$38 (= JCB+$38, terminal pointer)
-# contains $3E8000 (a DDT device field), pointing to uninitialized RAM.
-# The ACIA terminal init code allocated a terminal block via $A034/$A044 but
-# never set JCB+$38 because the ACIA detect/handshake bypasses prevented the
-# full initialization from completing.
-# Create a minimal terminal control block so COMINT's input wait loop can work.
-TCB_ADDR = 0x9080       # Terminal control block (needs ~$50 bytes: $9080-$90CF)
-TCB_BUF_ADDR = 0x9110   # Input buffer (64 bytes, after TRAPDOOR at $9100-$9103)
-TCB_BUF_SIZE = 64
-
-skip_hook = True
-# Clear the entire TCB area
-for i in range(0, 0x70, 2):
-    raw_write_word(TCB_ADDR + i, 0)
-# term+$00: status word — bits 0 and 3 must be set so the wait loop at
-# $1E18 (AND.W (A5),#9; BEQ → yield) passes. We intercept $A072 directly
-# in the main loop to handle read pointer updates ourselves.
-raw_write_word(TCB_ADDR + 0x00, 0x0009)
-# term+$12: input character count (initially 0 — no input yet)
-raw_write_word(TCB_ADDR + 0x12, 0)
-# term+$1A: input buffer capacity
-raw_write_long(TCB_ADDR + 0x1A, TCB_BUF_SIZE)
-# term+$44: input buffer base pointer
-raw_write_long(TCB_ADDR + 0x44, TCB_BUF_ADDR)
-# term+$48: input buffer size
-raw_write_long(TCB_ADDR + 0x48, TCB_BUF_SIZE)
-# Clear the input buffer
-for i in range(0, TCB_BUF_SIZE, 2):
-    raw_write_word(TCB_BUF_ADDR + i, 0)
-
-# Set JCB+$38 to point to our terminal block
-raw_write_long(DDT_ADDR + 0x38, TCB_ADDR)
-
-# Zero JCB+$20 — COMINT checks this at $390A to enter command-file mode.
-# The OS's file-open code at $3720 fails (no disk driver module in chain),
-# causing infinite $A03E yield loop. Instead, we zero JCB+$20 so COMINT
-# takes the normal terminal-input path, and inject AMOSL.INI commands
-# through the terminal buffer one by one (same mechanism as terminal I/O).
-raw_write_word(DDT_ADDR + 0x20, 0)
-
-skip_hook = False
-
-# ─── Step 6f: Load AMOSL.INI for command file injection ───
-import sys as _sys2
-_sys2.path.insert(0, '/Volumes/RAID0/repos/Alpha-Python/lib')
-from Alpha_Disk_Lib import AlphaDisk as _AlphaDisk
-_amosl_ini_lines = []
-_amosl_ini_pos = 0
-_ini_data_pending = False  # True when data is in TCB buffer but TCB+$00 not yet set
-with _AlphaDisk(str(src_path)) as _disk:
-    _dsk0 = _disk.get_logical_device(0)
-    _ini_data = _dsk0.read_file_contents((1, 4), "AMOSL", "INI")
-    if _ini_data:
-        # Parse into lines (AMOS uses CR+LF, terminated by LF=$0A)
-        _text = ""
-        for _b in _ini_data:
-            if _b == 0:
-                break
-            _text += chr(_b)
-        for _line in _text.split('\n'):
-            _line = _line.rstrip('\r')
-            if _line:  # skip empty lines
-                _amosl_ini_lines.append(_line)
-        print(f"\nStep 6f: Loaded AMOSL.INI: {len(_amosl_ini_lines)} command lines")
-        for i, l in enumerate(_amosl_ini_lines[:10]):
-            print(f"  [{i}] {l}")
-        if len(_amosl_ini_lines) > 10:
-            print(f"  ... ({len(_amosl_ini_lines) - 10} more)")
-    else:
-        print("\nStep 6f: WARNING - AMOSL.INI not found!")
-
-print(f"\nStep 6e: Created terminal control block at ${TCB_ADDR:06X}")
-print(f"  term+$00=${bus.read_word(TCB_ADDR):04X} term+$44=${read_long(TCB_ADDR+0x44):08X}"
-      f" term+$48=${read_long(TCB_ADDR+0x48):08X}")
-print(f"  JCB+$38 at ${DDT_ADDR+0x38:06X}: ${read_long(DDT_ADDR+0x38):08X}")
-print(f"  JCB+$20 at ${DDT_ADDR+0x20:06X}: ${bus.read_word(DDT_ADDR+0x20):04X}")
-
-# ─── Step 7: Main execution with ACIA bypasses + disk I/O ───
-
-print(f"\n{'='*60}")
-print("Step 7: RUNNING WITH ACIA BYPASSES + DISK I/O BYPASS")
-print(f"{'='*60}")
-
-bypass_counts = {
-    0x006C3E: 0,
-    0x006D80: 0,
-    0x006BDE: 0,
-    0x006D9C: 0,
-    0x006B68: 0,
-}
-a00a_intercepts = 0
-a006_count = 0
-a006_chars = bytearray()
-prompt_count = 0          # How many '.' prompts we've seen
-input_injected = False    # Whether we've injected input for current prompt
-lf_processed = False      # Whether line input handler returned after LF
-lf_processed_at = 0       # Instruction count when LF was processed
-
-DRIVER_END = DRIVER_RAM + MAX_COPY
-driver_entries = 0
-last_driver_pc = None
-
-extra_count = 0
-max_extra = 200_000_000 if INTERACTIVE else 50_000_000
-disk_a03c_just_skipped = False
-comint_stack_fixed = False
-
-# --- Interactive terminal setup ---
-_old_termios = None
-_stdin_buf = bytearray()  # Characters waiting to be injected into TCB
-
-def _setup_raw_terminal():
-    global _old_termios
-    if sys.stdin.isatty():
-        _old_termios = termios.tcgetattr(sys.stdin)
-        tty.setraw(sys.stdin.fileno())
-
-def _restore_terminal():
-    if _old_termios is not None:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _old_termios)
-
-_stdin_eof = False
-
-def _poll_stdin():
-    """Non-blocking read from stdin, returns bytes available."""
-    global _stdin_eof
-    if _stdin_eof:
-        return bytearray()
-    result = bytearray()
-    try:
-        while select.select([sys.stdin], [], [], 0)[0]:
-            ch = os.read(sys.stdin.fileno(), 1)
-            if not ch:  # EOF
-                _stdin_eof = True
-                break
-            result.append(ch[0])
-    except (OSError, ValueError):
-        _stdin_eof = True
-    return result
-
-def _inject_stdin_to_tcb():
-    """Move buffered stdin characters into TCB input buffer."""
-    global skip_hook
-    tcb_count = bus.read_word(TCB_ADDR + 0x12)
-    if tcb_count == 0:
-        # Reset read pointer when buffer is empty
-        skip_hook = True
-        raw_write_long(TCB_ADDR + 0x1E, TCB_BUF_ADDR)
-        skip_hook = False
-    # Ensure TCB status has bits 0+3 set (required by wait loop at $1E18)
-    # Boot code at $80B2/$38E8 clears this after our initial setup
-    skip_hook = True
-    raw_write_word(TCB_ADDR + 0x00, 0x0009)
-    skip_hook = False
-    while _stdin_buf and tcb_count < TCB_BUF_SIZE:
-        ch = _stdin_buf.pop(0)
-        if ch == 3:  # Ctrl+C
-            cpu.halted = True
-            return
-        if ch == 13:  # CR → LF for AMOS
-            ch = 0x0A
-        wr_pos = TCB_BUF_ADDR + tcb_count
-        skip_hook = True
-        bus.write_byte(wr_pos, ch)
-        raw_write_word(TCB_ADDR + 0x12, tcb_count + 1)
-        skip_hook = False
-        tcb_count += 1
-        # Echo the character to terminal
-        if ch == 0x0A:
-            sys.stdout.buffer.write(b'\r\n')
-        elif 0x20 <= ch < 0x7F:
-            sys.stdout.buffer.write(bytes([ch]))
-        sys.stdout.buffer.flush()
-
-if INTERACTIVE:
-    sys.stdout = _real_stdout  # Restore stdout after boot
-    sys.stdout.buffer.write(b"\r\n=== AMOS Interactive Mode ===\r\n"
-                            b"Type commands at the '.' prompt. Ctrl+C to exit.\r\n\r\n")
-    sys.stdout.buffer.flush()
-    _setup_raw_terminal()
-
-while not cpu.halted and extra_count < max_extra:
-    pc = cpu.pc
-
-    # --- Interactive: poll stdin periodically (buffer only, don't inject yet) ---
-    if INTERACTIVE and extra_count % 256 == 0:
-        new_chars = _poll_stdin()
-        if new_chars:
-            _stdin_buf.extend(new_chars)
-
-    # === LINE-A opcode intercepts for disk I/O ===
-    if disk_io_enabled:
+        # DDB-based I/O request (D6 < 0). A0 = DDB with +$0C=buffer, +$10=block.
+        # Check if A0 looks like a DDB (has +$08 pointing to DDT)
+        ddt_addr = None
         try:
-            op = bus.read_word(pc)
+            ddt_candidate = bus.read_long(a0 + 0x08) & 0xFFFFFF
+            if ddt_candidate > 0 and ddt_candidate < 0x100000:
+                ddt_addr = ddt_candidate
         except:
-            op = 0
+            pass
 
-        # $A03C — queue I/O: intercept and handle synchronously for disk
-        # A0 = DDT for mount operations, A0 = DDB for file I/O
-        # DDB+$08 contains DDT pointer; check if it references our disk DDT
-        if op == 0xA03C:
-            a0 = cpu.a[0] & 0xFFFFFF
-            is_ddt = (a0 == DDT_ADDR)
-            is_disk_ddb = False
-            if not is_ddt and a0 > 0 and a0 < 0x400000:
+        ok, blk, lba, buf = do_disk_read(a0)
+        if bypass_counts['a03c'] <= 30:
+            status = "OK" if ok else "OOR"
+            print(f"    DDB I/O: block={blk} LBA={lba} → ${buf:06X} [{status}]", flush=True, file=sys.stderr)
+
+        # Set DDT status to done, preserving JCB runnable bit
+        if ddt_addr and ddt_addr < 0x100000:
+            try:
+                bus.write_long(ddt_addr + 0x84, 0)
+                cur_status = bus.read_word(ddt_addr)
+                bus.write_word(ddt_addr, cur_status | 0x2000)
+            except:
+                pass
+
+    # Skip the $A03C instruction
+    cpu.pc = (cpu.pc + 2) & 0xFFFFFFFF
+    disk_a03c_just_skipped = True
+
+# ─── Python command handlers ───────────────────────────────────────
+import time as _time
+_bye_requested = False
+
+def _handle_command(cmd_name, rad50_val):
+    """Handle an AMOS command in Python. Returns output string."""
+    # Parse argument from command line (everything after command name)
+    try:
+        line_text = last_cmd_line.decode('ascii', errors='replace').strip()
+        # Command line is like "VER", "DIR", "TYPE AMOSL.INI"
+        parts = line_text.split(None, 1)
+        cmd_arg = parts[1] if len(parts) > 1 else ''
+    except Exception:
+        cmd_arg = ''
+    if cmd_name == 'VER':
+        return '\r\nAMOS/L V1.4C\r\n'
+    elif cmd_name == 'DAT':
+        t = _time.localtime()
+        months = ['Jan','Feb','Mar','Apr','May','Jun',
+                  'Jul','Aug','Sep','Oct','Nov','Dec']
+        return f'\r\n{t.tm_mday:02d}-{months[t.tm_mon-1]}-{t.tm_year}\r\n'
+    elif cmd_name == 'TIM':
+        t = _time.localtime()
+        return f'\r\n{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}\r\n'
+    elif cmd_name == 'BYE' or cmd_name == 'LOG':
+        global _bye_requested
+        _bye_requested = True
+        return '\r\nLogged off\r\n'
+    elif cmd_name == 'DIR':
+        return _cmd_dir()
+    elif cmd_name == 'TYP':
+        return _cmd_type(cmd_arg)
+    elif cmd_name == 'SYS' or cmd_name == 'SET':
+        return f'\r\n?{cmd_name} - not implemented in emulator\r\n'
+    elif cmd_name == 'DEV':
+        return '\r\nDSK0: SCZ  (emulated)\r\n'
+    elif cmd_name == 'FRE':
+        return '\r\n  DSK0: 60000 free blocks\r\n'
+    elif cmd_name == 'MEM':
+        membas = bus.read_long(0x0430) if bus.read_long(0x0430) else 0xAB00
+        return f'\r\n  MEMBAS = ${membas:06X}\r\n  RAM = {config.ram_size // 1024}KB\r\n'
+    elif cmd_name == 'HEL':
+        return ('\r\nAvailable commands:\r\n'
+                '  VER  - Show version\r\n'
+                '  DAT  - Show date\r\n'
+                '  TIM  - Show time\r\n'
+                '  DIR  - Directory listing\r\n'
+                '  TYPE - Display file contents\r\n'
+                '  MEM  - Memory info\r\n'
+                '  DEV  - Device table\r\n'
+                '  FRE  - Free space\r\n'
+                '  BYE  - Log off\r\n'
+                '  HEL  - This help\r\n')
+    else:
+        return f'\r\n?{cmd_name} - not available\r\n'
+
+def _cmd_dir():
+    """List files in [1,4] system directory."""
+    try:
+        _disk = AlphaDisk(str(BOOT_IMAGE))
+        _dev = _disk.get_logical_device(0)
+        ufd = _dev.read_user_file_directory((1, 4))
+        entries = ufd.get_active_entries()
+        lines = ['\r\n']
+        # Group by extension
+        exts = {}
+        for e in entries:
+            ext = e.extension.strip()
+            if ext not in exts:
+                exts[ext] = []
+            exts[ext].append(e)
+        total_blocks = 0
+        total_files = 0
+        for ext in sorted(exts.keys()):
+            for e in sorted(exts[ext], key=lambda x: x.filename):
+                name = e.filename.strip()
+                ex = e.extension.strip()
+                lines.append(f'  {name:10s}.{ex:3s}  {e.file_size:7d}\r\n')
+                total_blocks += e.block_count
+                total_files += 1
+                if total_files >= 40:
+                    lines.append(f'  ... and {len(entries) - 40} more files\r\n')
+                    break
+            if total_files >= 40:
+                break
+        lines.append(f'\r\n  {total_files} files, {total_blocks} blocks\r\n')
+        return ''.join(lines)
+    except Exception as ex:
+        return f'\r\n?DIR - error: {ex}\r\n'
+
+def _cmd_type(arg):
+    """Display contents of a file from disk. arg is 'FILENAME.EXT' or 'FILENAME'."""
+    if not arg:
+        return '\r\n?TYPE - missing filename\r\n'
+    try:
+        # Parse FILENAME.EXT — AMOS filenames are up to 6 chars, ext up to 3
+        arg = arg.strip().upper()
+        if '.' in arg:
+            name_part, ext_part = arg.split('.', 1)
+        else:
+            name_part, ext_part = arg, ''
+        name_part = name_part[:6]
+        ext_part = ext_part[:3]
+
+        _disk = AlphaDisk(str(BOOT_IMAGE))
+        _dev = _disk.get_logical_device(0)
+        # Try [1,4] system account
+        data = _dev.read_file_contents((1, 4), name_part, ext_part)
+        if data is None:
+            return f'\r\n?TYPE - file not found: {arg}\r\n'
+        # Convert to displayable text
+        # AMOS text files: bytes are direct ASCII
+        lines = ['\r\n']
+        line_count = 0
+        current = []
+        for b in data:
+            if b == 0x0A:  # LF = AMOS line terminator
+                lines.append(''.join(current) + '\r\n')
+                current = []
+                line_count += 1
+                if line_count >= 200:
+                    lines.append('  ... (truncated at 200 lines)\r\n')
+                    break
+            elif b == 0x0D:  # CR — skip
+                pass
+            elif b == 0x00:  # NUL — end of file content
+                if current:
+                    lines.append(''.join(current) + '\r\n')
+                break
+            elif 0x20 <= b < 0x7F:
+                current.append(chr(b))
+            elif b == 0x09:  # TAB
+                current.append('        ')
+            else:
+                current.append('.')
+        if current and line_count < 200:
+            lines.append(''.join(current) + '\r\n')
+        return ''.join(lines)
+    except Exception as ex:
+        return f'\r\n?TYPE - error: {ex}\r\n'
+
+print("V1.4C native SCSI boot + Python disk I/O...", flush=True, file=sys.stderr)
+
+try:
+    while step < config.max_instructions:
+        pc = cpu.pc
+
+        if led.value != last_led:
+            last_led = led.value
+            if led.value == 0 and step > 1_000_000:
+                boot_complete = True
+                acia_irq_disabled = True
+
+        if not boot_complete:
+            if pc == last_pc:
+                stuck_count += 1
+                if stuck_count >= 5000:
+                    cpu.d[7] = cpu.d[7] | 0xFF
+                    stuck_count = 0
+            else:
+                stuck_count = 0
+                last_pc = pc
+            cycles = cpu.step()
+            bus.tick(cycles)
+            step += 1
+            continue
+
+        if not sysvar_fixed:
+            sysvar_fixed = True
+
+            # Read actual boot structure addresses FIRST
+            native_zsydsk = bus.read_long(ZSYDSK_ADDR) & 0xFFFFFF
+            native_jobcur = bus.read_long(0x041C) & 0xFFFFFF
+            print(f"  Native: ZSYDSK=${native_zsydsk:06X} JOBCUR=${native_jobcur:06X}", flush=True, file=sys.stderr)
+
+            # Scan for highest boot structure address to set MEMBAS above all of them
+            high_water = 0x9600  # Minimum MEMBAS
+            for sysvar in [0x040C, 0x041C, 0x0414, 0x0434, 0x0408]:
+                addr = bus.read_long(sysvar) & 0xFFFFFF
+                if addr > 0 and addr < 0x100000:
+                    # Structure is ~256 bytes, so add $200 for safety
+                    candidate = (addr + 0x200 + 0xFF) & ~0xFF  # Round up to 256-byte boundary
+                    if candidate > high_water:
+                        high_water = candidate
+            actual_membas = high_water
+            CORRECT_MEMBAS_ACTUAL = actual_membas
+
+            bus.write_long(0x0430, actual_membas)
+            bus.write_long(0x0438, 0x3F0000)
+            bus.write_long(actual_membas, 0)
+            bus.write_long(actual_membas + 4, 0x3F0000 - actual_membas)
+            print(f"  MEMBAS=${actual_membas:08X}", flush=True, file=sys.stderr)
+
+            # ─── Patch existing DDB at ZSYDSK with V1.4C disk parameters ───
+            # Don't create a new DDB — patch the one the boot code already set up
+            if native_zsydsk > 0 and native_zsydsk < 0x100000:
+                ddb = native_zsydsk
+                bus.write_byte(ddb, 0x0F)                  # DK.FLG
+                bus.write_long(ddb + 0x0C, 512)            # DK.BPS
+                bus.write_long(ddb + 0x10, 32)             # DK.SPT
+                bus.write_long(ddb + 0x14, 16)             # DK.SPC
+                bus.write_long(ddb + 0x20, 1)              # DK.MFD
+                bus.write_long(ddb + 0x24, 2)              # DK.BMP
+                bus.write_long(ddb + 0x28, 0)              # DK.PAR
+                bus.write_long(ddb + 0x2C, 61531)          # DK.SIZ
+                # Set DDB I/O buffer if not already set
+                cur_buf = bus.read_long(ddb + 0x7C)
+                if cur_buf == 0 or cur_buf > 0x3F0000:
+                    bus.write_long(ddb + 0x7C, DDB_BUF_ADDR)
+                print(f"  Patched DDB at ${ddb:06X}: FLG=$0F MFD=1 BMP=2 PAR=0 SIZ=61531", flush=True, file=sys.stderr)
+                ddb_setup_done = True
+
+        if INIT_JCB is None:
+            jobcur = bus.read_long(0x041C)
+            if jobcur and jobcur < 0x100000:
+                INIT_JCB = jobcur
+                print(f"  Init JCB at ${INIT_JCB:08X}", flush=True, file=sys.stderr)
+
+        # ACIA detect bypass
+        if pc == 0x006BC6:
+            bypass_counts['detect'] += 1
+            a4 = cpu.a[4]
+            bus.write_byte(a4, 0x13)
+            cpu.pc = 0x006BCA
+            cpu.sr = (cpu.sr & 0xFF00) | 0x00
+            continue
+
+        # ─── CMDLIN init completion: detect sentinel OR $A008 (TTYLIN) ───
+        # The CMDLIN init code at $020032 does command registration then enters
+        # the COMINT command loop via $A008 (TTYLIN). It never returns to our sentinel.
+        # When we see $A008 during init, command registration is done — bail out.
+        init_complete = False
+        if cmdlin_init_phase and pc == INIT_SENTINEL:
+            init_complete = True
+            print(f"\n  CMDLIN init hit SENTINEL at step {step:,}", flush=True, file=sys.stderr)
+        elif cmdlin_init_phase:
+            try:
+                init_op = bus.read_word(pc)
+            except:
+                init_op = 0
+            if init_op == 0xA008:
+                init_complete = True
+                print(f"\n  CMDLIN init hit $A008 (TTYLIN) at step {step:,} — init complete", flush=True, file=sys.stderr)
+        if init_complete:
+            saved = cmdlin_init_saved
+            # Check what init accomplished
+            chain_head = bus.read_long(0x0414)
+            print(f"    Data area A5=${CMDLIN_DATA_ADDR:06X}", flush=True, file=sys.stderr)
+            cmd_tbl = bus.read_long(CMDLIN_DATA_ADDR + 0x0734)
+            jcb_ptr = bus.read_long(CMDLIN_DATA_ADDR + 0x03FC)
+            desc_ptr = bus.read_long(CMDLIN_DATA_ADDR + 0x040E)
+            print(f"    data+$0734 (cmd tbl)=${cmd_tbl:08X}", flush=True, file=sys.stderr)
+            print(f"    data+$03FC (JCB)=${jcb_ptr:08X}", flush=True, file=sys.stderr)
+            print(f"    data+$040E (desc)=${desc_ptr:08X}", flush=True, file=sys.stderr)
+            # Walk module chain looking for $FFFE entries
+            fffe_count = 0
+            print(f"    SYSBAS chain head=${chain_head:06X}", flush=True, file=sys.stderr)
+            ptr = chain_head
+            for idx in range(200):
+                if ptr == 0 or ptr >= 0x100000:
+                    break
+                w0 = bus.read_word(ptr)
+                w2 = bus.read_word(ptr + 2)
+                w4 = bus.read_word(ptr + 4)
+                w6 = bus.read_word(ptr + 6)
+                link = bus.read_long(ptr) & 0xFFFFFF
+                if idx < 10:
+                    print(f"    chain[{idx}] at ${ptr:06X}: +0=${w0:04X} +2=${w2:04X} "
+                          f"+4=${w4:04X} +6=${w6:04X} link=${link:06X}", flush=True, file=sys.stderr)
+                if w0 == 0xFFFE:
+                    fffe_count += 1
+                    print(f"    $FFFE entry at ${ptr:06X}: w0=${w0:04X} +2=${w2:04X} "
+                          f"+4=${w4:04X} +6=${w6:04X}", flush=True, file=sys.stderr)
+                ptr = link
+            print(f"    Total $FFFE entries: {fffe_count} (walked {idx+1} entries)", flush=True, file=sys.stderr)
+            # Scan data area for $FFFE words
+            fffe_in_data = []
+            for off in range(0, CMDLIN_DATA_SIZE, 2):
+                if bus.read_word(CMDLIN_DATA_ADDR + off) == 0xFFFE:
+                    fffe_in_data.append(off)
+            if fffe_in_data:
+                print(f"    $FFFE found in data area at offsets: {[f'${o:04X}' for o in fffe_in_data[:10]]}", flush=True, file=sys.stderr)
+            else:
+                print(f"    No $FFFE words found in data area", flush=True, file=sys.stderr)
+            # Check command table at data+$0734
+            cmd_tbl_addr = bus.read_long(CMDLIN_DATA_ADDR + 0x0734)
+            if cmd_tbl_addr and cmd_tbl_addr < 0x100000:
+                print(f"    Command table at ${cmd_tbl_addr:06X}:", flush=True, file=sys.stderr)
+                for j in range(0, 32, 2):
+                    w = bus.read_word(cmd_tbl_addr + j)
+                    print(f"      +${j:02X}: ${w:04X}", end="", flush=True, file=sys.stderr)
+                    if j % 8 == 6:
+                        print(flush=True, file=sys.stderr)
+                print(flush=True, file=sys.stderr)
+            # Scan wider range for $FFFE (module area $020000-$02A000)
+            fffe_wide = []
+            for off in range(0, 0xA000, 2):
                 try:
-                    ddb_ddt = read_long(a0 + 0x08) & 0xFFFFFF
-                    is_disk_ddb = (ddb_ddt == DDT_ADDR)
+                    if bus.read_word(0x020000 + off) == 0xFFFE:
+                        fffe_wide.append(0x020000 + off)
                 except:
                     pass
+            if fffe_wide:
+                print(f"    $FFFE found in $020000-$02A000: {[f'${a:06X}' for a in fffe_wide[:10]]}", flush=True, file=sys.stderr)
+            else:
+                print(f"    No $FFFE in $020000-$02A000 range", flush=True, file=sys.stderr)
+            d28 = bus.read_long(cmdlin_desc_addr + 0x28)
+            print(f"    desc+$28=${d28:08X}", flush=True, file=sys.stderr)
+            if d28 == 0:
+                bus.write_long(cmdlin_desc_addr + 0x28, CMDLIN_DATA_ADDR)
+            # Restore CPU state
+            cpu.pc = saved['pc']
+            cpu.sr = saved['sr']
+            for i in range(8):
+                cpu.d[i] = saved['d'][i]
+                cpu.a[i] = saved['a'][i]
+            cmdlin_init_phase = False
+            print(f"    CPU state restored, continuing COMINT setup", flush=True, file=sys.stderr)
+            pc = cpu.pc
+            # Fall through to continue COMINT setup
 
-            if not INTERACTIVE and not is_ddt and not is_disk_ddb and a03c_count < 5:
-                # Log unhandled $A03C calls for debugging
-                ddb_ddt_val = 0
-                if a0 > 0 and a0 < 0x400000:
-                    try:
-                        ddb_ddt_val = read_long(a0 + 0x08) & 0xFFFFFF
-                    except:
-                        pass
-                print(f"\n  $A03C SKIPPED: A0=${a0:06X} DDB+$08=${ddb_ddt_val:06X} "
-                      f"D6=${cpu.d[6]:08X} PC=${pc:06X}")
+        try:
+            opcode = bus.read_word(pc)
+        except:
+            opcode = 0
 
-            if is_ddt or is_disk_ddb:
-                a03c_count += 1
-                d6 = cpu.d[6] & 0xFF
+        # ─── SP tracking during CMDLIN init ───
+        if cmdlin_init_phase:
+            cur_sp = cpu.a[7] & 0xFFFFFF
+            if '_init_last_sp' not in bypass_counts:
+                bypass_counts['_init_last_sp'] = cur_sp
+                bypass_counts['_init_start_sp'] = cur_sp
+                print(f"  [INIT SP] start SP=${cur_sp:06X}", flush=True, file=sys.stderr)
+            if cur_sp != bypass_counts['_init_last_sp']:
+                print(f"  [INIT SP] step={step:,} PC=${pc:06X} op=${opcode:04X} "
+                      f"SP: ${bypass_counts['_init_last_sp']:06X} → ${cur_sp:06X}", flush=True, file=sys.stderr)
+                bypass_counts['_init_last_sp'] = cur_sp
 
-                if is_disk_ddb:
-                    # A0 is a DDB — do I/O directly on it
-                    ok, blk, lba, buf = do_disk_read(a0)
-                    if not INTERACTIVE and a03c_count <= 40:
-                        if ok:
-                            preview = [f"${bus.read_word(buf + j):04X}" for j in range(0, 16, 2)]
-                            print(f"\n  $A03C #{a03c_count}: DDB ${a0:06X} D6={d6} READ block={blk} LBA={lba} → ${buf:06X}")
-                            print(f"    Data: {' '.join(preview)}")
-                        else:
-                            print(f"\n  $A03C #{a03c_count}: DDB ${a0:06X} D6={d6} OUT OF RANGE block={blk} LBA={lba}")
-                else:
-                    # A0 is DDT — mount/status, also handle any queued DDBs
-                    ddb_list = find_ddb_for_ddt()
-                    for ddb_ptr in ddb_list:
-                        ok, blk, lba, buf = do_disk_read(ddb_ptr)
-                        if not INTERACTIVE and a03c_count <= 40:
-                            if ok:
-                                preview = [f"${bus.read_word(buf + j):04X}" for j in range(0, 16, 2)]
-                                print(f"\n  $A03C #{a03c_count}: DDT+DDB ${ddb_ptr:06X} READ block={blk} LBA={lba} → ${buf:06X}")
-                                print(f"    Data: {' '.join(preview)}")
-                            else:
-                                print(f"\n  $A03C #{a03c_count}: DDT+DDB OUT OF RANGE block={blk} LBA={lba}")
-                    if not ddb_list:
-                        if not INTERACTIVE and a03c_count <= 40:
-                            print(f"\n  $A03C #{a03c_count}: MOUNT (no DDB) D6={d6}")
-                        skip_hook = True
-                        raw_write_long(DDT_STATUS, 0)
-                        skip_hook = False
+        # ─── Count LINE-A calls after COMINT ───
+        if (opcode & 0xF000) == 0xA000 and comint_started:
+            linea_key = f'linea_{opcode:04X}'
+            bypass_counts[linea_key] = bypass_counts.get(linea_key, 0) + 1
+            # Capture D1 for all LINE-A calls to find text output
+            d1 = cpu.d[1] & 0xFF
+            if d1 >= 0x20 and d1 < 0x7F:
+                output_chars.append((step, d1, True, opcode))
+            # Detailed trace during CMDLIN init
+            if cmdlin_init_phase:
+                d6 = cpu.d[6]
+                a0 = cpu.a[0] & 0xFFFFFF
+                a5 = cpu.a[5] & 0xFFFFFF
+                print(f"  [INIT LINEA] ${opcode:04X} A0=${a0:06X} A5=${a5:06X} D6=${d6:08X} "
+                      f"SP=${cpu.a[7]&0xFFFFFF:06X}", flush=True, file=sys.stderr)
+            # Detailed trace of LINE-A calls during command processing
+            count = bypass_counts[linea_key]
+            if count <= 3 or opcode in (0xA068, 0xA06C, 0xA052, 0xA054, 0xA056):
+                d6 = cpu.d[6]
+                a0 = cpu.a[0] & 0xFFFFFF
+                a2 = cpu.a[2] & 0xFFFFFF
+                print(f"  [{step:,}] ${opcode:04X} A0=${a0:06X} A2=${a2:06X} D1=${cpu.d[1]:08X} D6=${d6:08X}", flush=True, file=sys.stderr)
 
-                cpu.pc = (pc + 2) & 0xFFFFFFFF
-                disk_a03c_just_skipped = True
-                if not INTERACTIVE and a03c_count <= 40:
-                    next_op = bus.read_word(cpu.pc)
-                    print(f"    Caller PC=${pc:06X}, next at ${cpu.pc:06X}: ${next_op:04X}")
-                extra_count += 1
+        # ─── $A03C (DSKIO) — Python disk I/O bypass ───
+        if opcode == 0xA03C and boot_complete:
+            handle_a03c()
+            continue
+
+        # ─── $A03A (async I/O queue) — skip when device subsystem not init ───
+        if opcode == 0xA03A and comint_started:
+            bypass_counts['a03a_skip'] += 1
+            # Return success: Z=1
+            cpu.sr = (cpu.sr & 0xFF00) | 0x04
+            cpu.pc = pc + 2
+            continue
+
+        # ─── $A06C (FIND) — intercept for command FIND and SYSMSG lookup ───
+        if opcode == 0xA06C and comint_started:
+            bypass_counts['a06c'] += 1
+
+            # COMINT command FIND at PC=$4A50: type=$0100, D6=1
+            # Return CMDLIN.SYS descriptor so COMINT can dispatch the command.
+            if pc == 0x4A50 and cmdlin_desc_addr:
+                bypass_counts['a06c_cmd'] = bypass_counts.get('a06c_cmd', 0) + 1
+                a4 = cpu.a[4] & 0xFFFFFF
+                r1 = bus.read_word(a4 + 0x06)
+                r2 = bus.read_word(a4 + 0x08)
+                last_find_rad50 = r1  # Save for dispatch
+                # FIND success: A6 = descriptor, D7 = 4, Z=1
+                cpu.a[6] = cmdlin_desc_addr
+                cpu.d[7] = 4
+                cpu.sr = (cpu.sr & 0xFF00) | 0x04  # Z=1
+                cpu.pc = pc + 2
+                if bypass_counts['a06c_cmd'] <= 10:
+                    print(f"  $A06C FIND CMD at $4A50: returning CMDLIN desc ${cmdlin_desc_addr:06X} "
+                          f"(search RAD50=${r1:04X}.${r2:04X})", flush=True, file=sys.stderr)
                 continue
 
-        # $A03E — yield/wait: if INI data is pending in TCB buffer,
-        # set TCB+$00 = $0009 so TTYLIN's wait loop finds data on next check.
-        if op == 0xA03E and _ini_data_pending:
-            skip_hook = True
-            raw_write_word(TCB_ADDR + 0x00, 0x0009)
-            skip_hook = False
-            _ini_data_pending = False
-            # Skip the yield — data is ready, no need to wait
-            cpu.pc = (pc + 2) & 0xFFFFFFFF
-            extra_count += 1
+            # SYSMSG FIND from message lookup area ($78xx)
+            if sysmsg_loaded:
+                caller_area = pc & 0xFFFF00
+                if caller_area == 0x007800:
+                    bypass_counts['a06c_sysmsg'] += 1
+                    cpu.a[6] = sysmsg_block_addr
+                    cpu.sr = (cpu.sr & 0xFF00) | 0x04
+                    cpu.pc = pc + 2
+                    if bypass_counts['a06c_sysmsg'] <= 5:
+                        print(f"  $A06C FIND intercepted at ${pc:06X}: returning SYSMSG at ${sysmsg_block_addr:06X}", flush=True, file=sys.stderr)
+                    continue
+
+        # ─── Trace message lookup code (first few calls) ───
+        # $7912: ADDA.L #$1E,A3 — shows A3 before offset
+        # $791E: MOVE.B $0F(A1),D4 — shows entry size
+        # $7926: TST.W (A3) — the critical test
+        if comint_started and sysmsg_loaded:
+            if pc == 0x7912 and bypass_counts.get('trace_7912', 0) < 5:
+                bypass_counts['trace_7912'] = bypass_counts.get('trace_7912', 0) + 1
+                a3 = cpu.a[3] & 0xFFFFFF
+                a1 = cpu.a[1] & 0xFFFFFF
+                d1 = cpu.d[1]
+                print(f"  MSG_LOOKUP $7912: A3=${a3:06X} A1=${a1:06X} D1=${d1:08X} (msg#={d1 & 0xFFFF})", flush=True, file=sys.stderr)
+            elif pc == 0x791E and bypass_counts.get('trace_791E', 0) < 5:
+                bypass_counts['trace_791E'] = bypass_counts.get('trace_791E', 0) + 1
+                a1 = cpu.a[1] & 0xFFFFFF
+                a3 = cpu.a[3] & 0xFFFFFF
+                d4 = cpu.d[4]
+                b = bus.read_byte(a1 + 0x0F) if a1 < 0x100000 else 0
+                print(f"  MSG_LOOKUP $791E: A1=${a1:06X} A3=${a3:06X} byte(A1+$0F)=${b:02X} D4=${d4:08X}", flush=True, file=sys.stderr)
+            elif pc == 0x7926 and bypass_counts.get('trace_7926', 0) < 5:
+                bypass_counts['trace_7926'] = bypass_counts.get('trace_7926', 0) + 1
+                a3 = cpu.a[3] & 0xFFFFFF
+                w = bus.read_word(a3) if a3 < 0x100000 else 0
+                d1 = cpu.d[1]
+                d4 = cpu.d[4]
+                print(f"  MSG_LOOKUP $7926: A3=${a3:06X} (A3)=${w:04X} D1=${d1:08X} D4={d4:08X}", flush=True, file=sys.stderr)
+
+        # ─── $A0CA (TTYOUT — single char output) — capture char ───
+        if opcode == 0xA0CA:
+            bypass_counts['a0ca'] += 1
+            ch = cpu.d[1] & 0xFF
+            output_chars.append((step, ch, comint_started, 0xA0CA))
+            # Suppress native TTYOUT to stdout — Python command handler
+            # writes all command output directly. Native output is garbled
+            # because SYSMSG lookup code isn't loaded.
+            cpu.pc = pc + 2
             continue
 
-        # $A03E — yield/wait: skip if disk I/O was just handled synchronously.
-        # After synchronous $A03C, the caller may issue MULTIPLE $A03E calls
-        # (e.g., file-open code loops waiting for I/O completion). Skip them all
-        # within a window after the last $A03C intercept.
-        if op == 0xA03E and disk_a03c_just_skipped:
-            if not INTERACTIVE and a03c_count <= 40:
-                print(f"    $A03E skipped at PC=${pc:06X} (disk I/O done synchronously)")
-            cpu.pc = (pc + 2) & 0xFFFFFFFF
-            extra_count += 1
+        # ─── $A086 — skip during boot (terminal control) AND during
+        #      command dispatch when D6=$1C03 (DSK device I/O).
+        #      Module code is already in RAM; the handler tries async disk
+        #      reads via $A03A which hang because the device subsystem
+        #      ($0404/$0408) is not initialized.
+        if opcode == 0xA086:
+            d6_val = cpu.d[6] & 0xFFFF
+            if not comint_started:
+                bypass_counts['a086'] += 1
+                cpu.pc = pc + 2
+                continue
+            if d6_val == 0x1C03:
+                bypass_counts['a086_dsk'] += 1
+                # Return success: Z=1, skip opcode
+                cpu.sr = (cpu.sr & 0xFF00) | 0x04
+                cpu.pc = pc + 2
+                continue
+
+        # ─── Trace SRCH entry ($1C30) ───
+        if pc == 0x1C30 and comint_started:
+            bypass_counts['srch_entry'] = bypass_counts.get('srch_entry', 0) + 1
+            if bypass_counts['srch_entry'] <= 5:
+                d0 = cpu.d[0]
+                d1 = cpu.d[1]
+                a0 = cpu.a[0] & 0xFFFFFF
+                a2 = cpu.a[2] & 0xFFFFFF
+                a3 = cpu.a[3] & 0xFFFFFF
+                a4 = cpu.a[4] & 0xFFFFFF
+                a6 = cpu.a[6] & 0xFFFFFF
+                sp = cpu.a[7] & 0xFFFFFF
+                print(f"\n  SRCH ENTRY $1C30 #{bypass_counts['srch_entry']}:", flush=True, file=sys.stderr)
+                print(f"    D0=${d0:08X} D1=${d1:08X} D6=${cpu.d[6]:08X} D7=${cpu.d[7]:08X}", flush=True, file=sys.stderr)
+                print(f"    A0=${a0:06X} A2=${a2:06X} A3=${a3:06X} A4=${a4:06X} A6=${a6:06X} SP=${sp:06X}", flush=True, file=sys.stderr)
+                # Show SYSBAS chain
+                sysbas = bus.read_long(0x0414) & 0xFFFFFF
+                jcb_chain = bus.read_long(INIT_JCB + 0x0C) & 0xFFFFFF if INIT_JCB else 0
+                print(f"    SYSBAS=${sysbas:06X} JCB+$0C=${jcb_chain:06X}", flush=True, file=sys.stderr)
+
+        # ─── Trace SRCH module loop ($1C6E) ───
+        if pc == 0x1C6E and comint_started:
+            bypass_counts['srch_loop'] = bypass_counts.get('srch_loop', 0) + 1
+            if bypass_counts['srch_loop'] <= 10:
+                a0 = cpu.a[0] & 0xFFFFFF
+                a6 = cpu.a[6] & 0xFFFFFF
+                # Read module type and RAD50 name at A6
+                if a6 > 0 and a6 < 0x100000:
+                    m_type = bus.read_word(a6 + 0x04)
+                    m_r1 = bus.read_word(a6 + 0x06)
+                    m_r2 = bus.read_word(a6 + 0x08)
+                    m_r3 = bus.read_word(a6 + 0x0A)
+                    m_link = bus.read_long(a6)
+                    print(f"    SRCH LOOP $1C6E: A6=${a6:06X} type=${m_type:04X} "
+                          f"name=${m_r1:04X}.${m_r2:04X}.${m_r3:04X} link=${m_link:08X}", flush=True, file=sys.stderr)
+
+        # ─── Trace $A0DC (CMDINT) handler ───
+        if opcode == 0xA0DC and comint_started:
+            bypass_counts['a0dc'] = bypass_counts.get('a0dc', 0) + 1
+            if bypass_counts['a0dc'] <= 5:
+                a0 = cpu.a[0] & 0xFFFFFF
+                a3 = cpu.a[3] & 0xFFFFFF
+                a6 = cpu.a[6] & 0xFFFFFF
+                print(f"\n  $A0DC CMDINT #{bypass_counts['a0dc']} at PC=${pc:06X}:", flush=True, file=sys.stderr)
+                print(f"    A0=${a0:06X} A3=${a3:06X} A6=${a6:06X}", flush=True, file=sys.stderr)
+                print(f"    D0=${cpu.d[0]:08X} D1=${cpu.d[1]:08X} D6=${cpu.d[6]:08X}", flush=True, file=sys.stderr)
+
+        # ─── Trace $6240 (command search) ───
+        if pc == 0x6240 and comint_started:
+            bypass_counts['cmd_search_6240'] = bypass_counts.get('cmd_search_6240', 0) + 1
+            if bypass_counts['cmd_search_6240'] <= 5:
+                a0 = cpu.a[0] & 0xFFFFFF
+                a3 = cpu.a[3] & 0xFFFFFF
+                a6 = cpu.a[6] & 0xFFFFFF
+                d0 = cpu.d[0]
+                d1 = cpu.d[1]
+                v0448 = bus.read_long(0x0448)
+                print(f"\n  CMD SEARCH $6240 #{bypass_counts['cmd_search_6240']}:", flush=True, file=sys.stderr)
+                print(f"    A0=${a0:06X} A3=${a3:06X} A6=${a6:06X}", flush=True, file=sys.stderr)
+                print(f"    D0=${d0:08X} D1=${d1:08X} D6=${cpu.d[6]:08X} D7=${cpu.d[7]:08X}", flush=True, file=sys.stderr)
+                print(f"    ($0448)=${v0448:08X}", flush=True, file=sys.stderr)
+                # Dump A3 context area if valid
+                if a3 > 0 and a3 < 0x100000:
+                    print(f"    A3 context: +$00=${bus.read_word(a3):04X} +$02=${bus.read_word(a3+2):04X} "
+                          f"+$04=${bus.read_word(a3+4):04X} +$06=${bus.read_long(a3+6):08X} "
+                          f"+$0A=${bus.read_word(a3+0xA):04X} +$0C=${bus.read_long(a3+0xC):08X} "
+                          f"+$14=${bus.read_word(a3+0x14):04X}", flush=True, file=sys.stderr)
+
+        # ─── CMDLIN init RTS diagnostic ───
+        if pc == 0x02010A and cmdlin_init_phase:
+            sp = cpu.a[7] & 0xFFFFFF
+            ret_addr = bus.read_long(sp) if sp < 0x100000 else 0
+            print(f"  !!! CMDLIN init RTS at $02010A: SP=${sp:06X} ret=${ret_addr:08X} "
+                  f"sentinel=${INIT_SENTINEL:06X}", flush=True, file=sys.stderr)
+
+        # ─── Trace jump to CMDLIN module ───
+        if comint_started and 0x020000 <= pc <= 0x030000:
+            key = f'trace_cmdlin_{pc:06X}'
+            bypass_counts[key] = bypass_counts.get(key, 0) + 1
+            cnt = bypass_counts[key]
+            if cnt <= 1 or (pc == 0x020058 and cnt in (1, 2, 100, 1000)):
+                print(f"  CMDLIN ${pc:06X}: op=${opcode:04X} "
+                      f"A4=${cpu.a[4]&0xFFFFFF:06X} A5=${cpu.a[5]&0xFFFFFF:06X} "
+                      f"A6=${cpu.a[6]&0xFFFFFF:06X} D6=${cpu.d[6]:08X} "
+                      f"SP=${cpu.a[7]&0xFFFFFF:06X}", flush=True, file=sys.stderr)
+
+        # ─── Track last ROM PC before entering CMDLIN area ───
+        if comint_started and pc < 0x020000:
+            _last_rom_pc = pc
+        elif comint_started and 0x020000 <= pc <= 0x030000:
+            if bypass_counts.get('cmdlin_entry_logged', 0) == 0:
+                bypass_counts['cmdlin_entry_logged'] = 1
+                print(f"  >>> CMDLIN ENTRY: from ROM ${_last_rom_pc:06X} → ${pc:06X}", flush=True, file=sys.stderr)
+                sp = cpu.a[7] & 0xFFFFFF
+                print(f"      A5=${cpu.a[5]&0xFFFFFF:06X} SP=${sp:06X}", flush=True, file=sys.stderr)
+
+        # ─── Trace COMINT dispatch flow $4BAA-$4BF0 ───
+        if comint_started and 0x4BA0 <= pc <= 0x4BF0:
+            key = f'trace_4bxx_{pc:04X}'
+            bypass_counts[key] = bypass_counts.get(key, 0) + 1
+            if bypass_counts[key] <= 2:
+                a4 = cpu.a[4] & 0xFFFFFF
+                a5 = cpu.a[5] & 0xFFFFFF
+                d5 = cpu.d[5]
+                d7 = cpu.d[7]
+                print(f"  DISPATCH ${pc:06X}: op=${opcode:04X} A4=${a4:06X} A5=${a5:06X} "
+                      f"D5=${d5:08X} D7=${d7:08X}", flush=True, file=sys.stderr)
+                if pc == 0x4BAA:
+                    # Show the ext comparison
+                    ext_val = bus.read_word(a4 + 0x0A)
+                    print(f"    A4+$0A=${ext_val:04X} (compare with $4C7C=LIT)", flush=True, file=sys.stderr)
+
+        # ─── $4BE6 JMP (A5) — Python-side command handler ───
+        # CMDLIN init can't populate its command table (AMOS system services
+        # unavailable), so we handle commands directly in Python.
+        if pc == 0x4BE6 and opcode == 0x4ED5 and comint_started:
+            a5 = cpu.a[5] & 0xFFFFFF
+            if a5 == cmdlin_desc_addr and cmdlin_desc_addr:
+                bypass_counts['jmp_a5_fix'] = bypass_counts.get('jmp_a5_fix', 0) + 1
+                def _r50(w):
+                    c = ' ABCDEFGHIJKLMNOPQRSTUVWXYZ$.%0123456789'
+                    c3 = w % 40; w //= 40; c2 = w % 40; w //= 40; c1 = w % 40
+                    return c[c1] + c[c2] + c[c3]
+                cmd_name = _r50(last_find_rad50).strip()
+                output = _handle_command(cmd_name, last_find_rad50)
+                # Write prompt + command output (native TTYOUT suppressed)
+                sys.stdout.buffer.write(b'.')
+                sys.stdout.buffer.write(output.encode('ascii'))
+                sys.stdout.buffer.flush()
+                if _bye_requested:
+                    print(f"\n  BYE command — halting emulator", flush=True, file=sys.stderr)
+                    break
+                # Return to COMINT via $A0DC (CMDINT).
+                cpu.pc = 0x470A
+                if bypass_counts['jmp_a5_fix'] <= 10:
+                    print(f"  CMD {cmd_name}: handled, restarting COMINT via $A0DC at $470A", flush=True, file=sys.stderr)
+                continue
+
+        # ─── Trace dispatch path ───
+        if comint_started and 0x5A00 <= pc <= 0x5F00:
+            key = f'trace_5xxx_{pc:04X}'
+            bypass_counts[key] = bypass_counts.get(key, 0) + 1
+            if bypass_counts[key] <= 2:
+                print(f"  TRACE ${pc:06X}: opcode=${opcode:04X} "
+                      f"A4=${cpu.a[4]&0xFFFFFF:06X} A6=${cpu.a[6]&0xFFFFFF:06X} "
+                      f"D0=${cpu.d[0]:08X} D7=${cpu.d[7]:08X}", flush=True, file=sys.stderr)
+
+        # ─── $5A9C module dispatch intercept ───
+        # At $5AB6: TST.L desc+$28 — skip this check for our modules
+        # so the code falls through to the init path (where A5 gets set up).
+        # At $5AE0: MOVEA.L desc+$24,A1 — intercept and jump directly
+        # to the module's code entry, bypassing the driver init.
+        if pc == 0x5AB6 and comint_started:
+            a4 = cpu.a[3] & 0xFFFFFF  # A4 = descriptor (68k reg 12)
+            # Note: cpu.a[] indexing — A4 is cpu.a[4] in some impls
+            a4 = cpu.a[4] & 0xFFFFFF
+            if a4 in module_entries:
+                # Skip TST.L (4 bytes) + BNE (4 bytes) = 8 bytes
+                cpu.pc = 0x5ABE
+                bypass_counts['dispatch_skip_5ab6'] += 1
+                if bypass_counts['dispatch_skip_5ab6'] <= 5:
+                    print(f"  DISPATCH $5AB6: skip desc+$28 test for module at ${a4:06X}", flush=True, file=sys.stderr)
+                continue
+
+        if pc == 0x5AE0 and comint_started:
+            a4 = cpu.a[4] & 0xFFFFFF
+            if a4 in module_entries:
+                code_entry = module_entries[a4]
+                cpu.pc = code_entry
+                bypass_counts['dispatch_5ae0'] += 1
+                if bypass_counts['dispatch_5ae0'] <= 5:
+                    print(f"  DISPATCH $5AE0: jumping to code at ${code_entry:06X} "
+                          f"A5=${cpu.a[5] & 0xFFFFFF:06X}", flush=True, file=sys.stderr)
+                continue
+
+        # ─── Exception handler trace ───
+        # Illegal instruction handler at $0F96, Line-F at $10BC
+        # Capture the faulting PC from the exception frame
+        if pc in (0x0F96, 0x10BC, 0x0F58) and comint_started:
+            vec_name = {0x0F96: "ILLEGAL", 0x10BC: "LINE-F", 0x0F58: "ADDR_ERR"}[pc]
+            # Exception frame: SR at (SP), PC at (SP+2)
+            sp = cpu.a[7] & 0xFFFFFF
+            frame_sr = bus.read_word(sp)
+            frame_pc = bus.read_long(sp + 2)
+            bypass_counts[f'exc_{vec_name}'] += 1
+            if bypass_counts[f'exc_{vec_name}'] <= 5:
+                # Try to read the faulting instruction
+                try:
+                    fault_word = bus.read_word(frame_pc)
+                except:
+                    fault_word = 0xDEAD
+                print(f"\n  *** {vec_name} EXCEPTION at PC=${frame_pc:06X} "
+                      f"opcode=${fault_word:04X} SR=${frame_sr:04X} SP=${sp:06X}", flush=True, file=sys.stderr)
+                # Show some context
+                print(f"      D0-D3: ${cpu.d[0]:08X} ${cpu.d[1]:08X} ${cpu.d[2]:08X} ${cpu.d[3]:08X}", flush=True, file=sys.stderr)
+                print(f"      A0-A3: ${cpu.a[0]:08X} ${cpu.a[1]:08X} ${cpu.a[2]:08X} ${cpu.a[3]:08X}", flush=True, file=sys.stderr)
+                print(f"      A4-A6: ${cpu.a[4]:08X} ${cpu.a[5]:08X} ${cpu.a[6]:08X}", flush=True, file=sys.stderr)
+
+        # Handshake bypass
+        if pc == 0x006D80:
+            bypass_counts['handshake'] += 1
+            cpu.pc = 0x006DDE
+            cpu.sr = (cpu.sr & 0xFF00) | 0x04
             continue
 
-        # Clear the skip flag when we execute a non-$A03E instruction
-        # (means the caller has moved on past the I/O wait)
-        if disk_a03c_just_skipped and op != 0xA03E:
+        # ─── $A03E yield ───
+        if opcode == 0xA03E:
+            d6 = cpu.d[6] & 0xFFFF
+            bypass_counts[f'a03e_d6_{d6:02X}'] += 1
+
+            # During CMDLIN init: suppress ALL yields to prevent scheduler
+            # from switching context and losing our sentinel return address
+            if cmdlin_init_phase:
+                cpu.pc = pc + 2
+                continue
+
+        # ─── CMDLIN init: force registration path ───
+        # At $02009E (desc+$0092): BNE $0200F0 checks if char class setup succeeded.
+        # If data+$526=$85 (success), BNE taken → skips command registration!
+        # Force Z=1 so BNE is NOT taken, allowing registration to proceed.
+        if cmdlin_init_phase and pc == 0x02009E:
+            cpu.sr = (cpu.sr & 0xFF00) | 0x04  # Z=1
+            print(f"  [INIT] Forced Z=1 at $02009E to enter registration path", flush=True, file=sys.stderr)
+
+            if comint_started:
+                if d6 == 2:
+                    if ini_data_pending:
+                        bus.write_word(TCB_ADDR + 0x00, 0x0009)
+                        ini_data_pending = False
+                    elif cmd_index >= len(test_commands) and bypass_counts.get('a03e_d6_02', 0) > 20:
+                        print(f"\n=== Halting at step {step:,} ===", flush=True, file=sys.stderr)
+                        break
+
+                # Maintain JOBCUR
+                if INIT_JCB and bus.read_long(0x041C) == 0:
+                    bus.write_long(0x041C, INIT_JCB)
+
+            # Skip $A03E after synchronous disk I/O
+            if disk_a03c_just_skipped and boot_complete:
+                cpu.pc = (pc + 2) & 0xFFFFFFFF
+                continue
+
+        # Clear disk I/O flag on any non-$A03E instruction
+        if opcode != 0xA03E:
             disk_a03c_just_skipped = False
 
-        # $A064 — memory module validation: bypass with Z=1 (success)
-        # During early boot, JCB+$18 (module chain) is NULL, so all validation
-        # fails with "Memory Map Destroyed". Bypass until modules are loaded.
-        if op == 0xA064:
-            if not INTERACTIVE and extra_count < 50000:
-                print(f"  >> $A064 BYPASS at [{extra_count}] PC=${pc:06X}")
-            # Set Z flag in SR to indicate success (BEQ will be taken by caller)
-            cpu.sr = (cpu.sr & ~0x04) | 0x04  # set Z bit
-            cpu.pc = (pc + 2) & 0xFFFFFFFF
-            extra_count += 1
+        # After init → set up COMINT
+        if pc == 0x001C56 and not comint_started and INIT_JCB:
+            bypass_counts['sched_idle'] += 1
+            if bypass_counts.get('a086', 0) >= 5:
+                comint_started = True
+                print(f"\n=== COMINT setup at step {step:,} ===", flush=True, file=sys.stderr)
+                jcb = INIT_JCB
+                for i in range(0, 0x70, 2):
+                    bus.write_word(TCB_ADDR + i, 0)
+                bus.write_long(TCB_ADDR + 0x1A, TCB_BUF_SIZE)
+                bus.write_long(TCB_ADDR + 0x44, TCB_BUF_ADDR)
+                bus.write_long(TCB_ADDR + 0x48, TCB_BUF_SIZE)
+                for i in range(0, TCB_BUF_SIZE, 2):
+                    bus.write_word(TCB_BUF_ADDR + i, 0)
+                bus.write_long(jcb + 0x38, TCB_ADDR)
+                bus.write_word(jcb + 0x20, 0)
+                bus.write_long(jcb + 0x104, 0)
+
+                # Set JCB+$14 = nonzero (privilege/login status)
+                # COMINT at $4AFA checks TST.W $14(A0) and takes error path
+                # if zero. $0102 = normal logged-in user privilege.
+                bus.write_word(jcb + 0x14, 0x0102)
+                print(f"  JCB+$14 = $0102 (user privilege)", flush=True, file=sys.stderr)
+
+                # Load system modules and set up SRCH chain
+                module_chain = load_sys_modules()
+                if module_chain:
+                    bus.write_long(0x0414, module_chain)  # SYSBAS
+                    print(f"  SYSBAS=${module_chain:06X} (module chain loaded)", flush=True, file=sys.stderr)
+                bus.write_long(jcb + 0x0C, module_chain if module_chain else 0)
+                bus.write_long(jcb + 0x78, 0)
+
+                # Fix CMDLIN descriptor fields for proper $A080 initialization
+                # desc+$24 and desc+$28 contain raw code bytes from the file.
+                # $A080 checks desc+$28: nonzero = "already initialized" → skips init.
+                # We must zero them so $A080 (or our manual init) works correctly.
+                if cmdlin_desc_addr:
+                    bus.write_long(cmdlin_desc_addr + 0x24, 0)  # init code vector
+                    bus.write_long(cmdlin_desc_addr + 0x28, 0)  # initialized flag
+                    print(f"  CMDLIN desc+$24/$28 zeroed for init", flush=True, file=sys.stderr)
+
+                    # Allocate and clear CMDLIN data area (separate from module code!)
+                    for i in range(0, CMDLIN_DATA_SIZE, 2):
+                        bus.write_word(CMDLIN_DATA_ADDR + i, 0)
+                    print(f"  CMDLIN data area at ${CMDLIN_DATA_ADDR:06X} ({CMDLIN_DATA_SIZE} bytes)", flush=True, file=sys.stderr)
+
+                    # Launch CMDLIN init: save CPU state, redirect to init code
+                    cmdlin_init_saved = {
+                        'pc': cpu.pc, 'sr': cpu.sr,
+                        'd': [cpu.d[i] for i in range(8)],
+                        'a': [cpu.a[i] for i in range(8)],
+                    }
+                    # Set up registers for init code at $020032:
+                    #   A5 = data area, A0 = JCB, A4 = descriptor
+                    init_addr = cmdlin_desc_addr + 0x26  # desc+$08 = $002A → file+$002A → desc + ($2A-4) = desc+$26
+                    cpu.a[5] = CMDLIN_DATA_ADDR
+                    cpu.a[0] = jcb
+                    cpu.a[4] = cmdlin_desc_addr
+                    cpu.a[2] = 0
+                    cpu.a[3] = 0
+                    cpu.d[7] = 0
+                    # Push sentinel return address on stack
+                    sp = cpu.a[7]
+                    sp -= 4
+                    bus.write_long(sp, INIT_SENTINEL)
+                    cpu.a[7] = sp
+                    cpu.pc = init_addr
+                    cmdlin_init_phase = True
+                    print(f"  CMDLIN init launched: PC=${init_addr:06X} A5=${CMDLIN_DATA_ADDR:06X}", flush=True, file=sys.stderr)
+                    # Continue main loop — init code will execute with all LINE-A handlers active
+
+                # Load SYSMSG.USA into memory for message lookup
+                sysmsg_addr = load_sysmsg()
+                if sysmsg_addr:
+                    sysmsg_block_addr = sysmsg_addr
+                    sysmsg_loaded = True
+
+                # Create zeroed sysdata block for JCB+$D0
+                # $A068 MATCH reads JCB+$D0+$45 (special chars), +$56 (alpha ext),
+                # +$74 (ERSATZ table). Raw SYSMSG data at those offsets is wrong.
+                for i in range(0, 0x100, 2):
+                    bus.write_word(SYSDATA_ADDR + i, 0)
+                bus.write_long(jcb + 0xD0, SYSDATA_ADDR)
+                print(f"  JCB+$D0 = ${SYSDATA_ADDR:06X} (zeroed sysdata)", flush=True, file=sys.stderr)
+                if sysmsg_addr:
+                    print(f"  SYSMSG at ${sysmsg_addr:06X} (for message lookup intercept)", flush=True, file=sys.stderr)
+                status = bus.read_word(jcb)
+                bus.write_word(jcb, status | 0x2000)
+                bus.write_long(0x041C, jcb)
+                safe_sp = 0x8700
+                bus.write_word(safe_sp - 6, 0x2000)
+                bus.write_long(safe_sp - 4, COMINT_ENTRY)
+                bus.write_long(jcb + 0x80, safe_sp - 6)
+                bus.write_long(jcb + 0x7C, safe_sp)
+                sys_dispatch = bus.read_long(0x0514)
+                print(f"  JCB=${jcb:08X} JOBCUR=${bus.read_long(0x041C):08X}", flush=True, file=sys.stderr)
+                print(f"  ($0514) dispatch vector=${sys_dispatch:08X}", flush=True, file=sys.stderr)
+                if sys_dispatch and sys_dispatch < 0x100000:
+                    print(f"  dispatch+$04=${bus.read_word(sys_dispatch + 4):04X} "
+                          f"dispatch+$06=${bus.read_word(sys_dispatch + 6):04X}", flush=True, file=sys.stderr)
+
+        # $A072 (terminal read)
+        if opcode == 0xA072 and comint_started:
+            bypass_counts['a072'] += 1
+            term = bus.read_long(bus.read_long(0x041C) + 0x38) if bus.read_long(0x041C) else TCB_ADDR
+            if term and term < 0x100000:
+                rptr = bus.read_long(term + 0x1E)
+                count = bus.read_word(term + 0x12)
+                if count > 0 and rptr and rptr < 0x100000:
+                    ch = bus.read_byte(rptr)
+                    bus.write_long(term + 0x1E, rptr + 1)
+                    bus.write_word(term + 0x12, count - 1)
+                    cpu.d[1] = (cpu.d[1] & 0xFFFFFF00) | ch
+                else:
+                    cpu.d[1] = (cpu.d[1] & 0xFFFFFF00) | 0
+            cpu.pc = pc + 2
             continue
 
-        # $A006 — type character
-        if op == 0xA006 and pc < 0x8000:
-            a006_count += 1
-            d1 = cpu.d[1] & 0x7F
-            a006_chars.append(d1)
-            if INTERACTIVE:
-                # Write directly to stdout with CR/LF translation
-                if d1 == 0x0A:
-                    sys.stdout.buffer.write(b'\r\n')
-                elif d1 == 0x0D:
-                    sys.stdout.buffer.write(b'\r')
-                elif d1 >= 0x20:
-                    sys.stdout.buffer.write(bytes([d1]))
-                sys.stdout.buffer.flush()
-                banner_chars.append(d1)
-            else:
-                if d1 >= 0x20 or d1 in (0x0A, 0x0D):
-                    acia.write(0xFFFFC9, 1, d1)
-                    banner_chars.append(d1)
-                if a006_count <= 30:
-                    print(f"\n  $A006 #{a006_count}: char=${d1:02X} ('{chr(d1) if 0x20<=d1<0x7F else '?'}')"
-                          f" PC=${pc:06X}")
-            if d1 == 0x2E:  # '.' prompt character
-                prompt_count += 1
-            cpu.pc = (pc + 2) & 0xFFFFFFFF
-            extra_count += 1
-            continue
+        # $A008 (TTYLIN)
+        if opcode == 0xA008 and comint_started:
+            bypass_counts['a008'] += 1
+            print(f"\n  [step {step:,}] $A008 TTYLIN #{bypass_counts['a008']}", flush=True, file=sys.stderr)
+            input_injected = False
+            ini_data_pending = False
+            if cmd_index < len(test_commands):
+                last_cmd_line = test_commands[cmd_index]
+                inject_input_to_tcb(test_commands[cmd_index])
+                print(f"    Injected: {test_commands[cmd_index]!r}", flush=True, file=sys.stderr)
+                cmd_index += 1
 
-        # $A008 — TTYLIN (read line): inject AMOSL.INI lines here.
-        # The TTYLIN handler at $1E00 checks term+$00 & 9: if nonzero, returns
-        # immediately without reading. If zero, enters wait loop calling $A03E.
-        # Strategy: inject data into TCB buffer but leave TCB+$00 = 0. The handler
-        # enters the wait loop, and at $A03E we set TCB+$00 = $0009 so the handler
-        # finds data on its next iteration and reads via $A072.
-        if op == 0xA008 and pc < 0x8000:
-            if not INTERACTIVE and _amosl_ini_pos < len(_amosl_ini_lines):
-                line = _amosl_ini_lines[_amosl_ini_pos]
-                _amosl_ini_pos += 1
-                cmd = line.encode('ascii', errors='replace') + b'\x0A'
-                skip_hook = True
-                for ci, ch in enumerate(cmd):
-                    bus.write_byte(TCB_BUF_ADDR + ci, ch)
-                raw_write_long(TCB_ADDR + 0x1E, TCB_BUF_ADDR)
-                raw_write_word(TCB_ADDR + 0x12, len(cmd))
-                # DO NOT set TCB+$00 here — leave it at 0 so TTYLIN enters wait loop
-                raw_write_word(TCB_ADDR + 0x00, 0x0000)
-                skip_hook = False
-                _ini_data_pending = True
-                print(f"\n  >> INI [{_amosl_ini_pos}/{len(_amosl_ini_lines)}]: '{line}'"
-                      f" PC=${pc:06X}")
-            elif not INTERACTIVE and _amosl_ini_pos == len(_amosl_ini_lines):
-                _amosl_ini_pos += 1
-                print(f"\n  >> AMOSL.INI COMPLETE: {len(_amosl_ini_lines)} lines processed")
-            elif not INTERACTIVE and _amosl_ini_pos > len(_amosl_ini_lines) and prompt_count > len(_amosl_ini_lines) + 10:
-                print(f"\n  >> {prompt_count} prompts seen (INI done), stopping")
-                cpu.halted = True
-            # Let the OS's $A008 handler run — it enters wait loop, finds data at $A03E
+        # Maintain JOBCUR
+        if comint_started and INIT_JCB:
+            if bus.read_long(0x041C) == 0:
+                bus.write_long(0x041C, INIT_JCB)
 
-        # $A072 — read terminal character: intercept and serve from our buffer
-        # The OS handler's shortcut path (TCB+$00 & 9 != 0) skips updating
-        # the read pointer term+$1E, causing repeated reads of the same char.
-        # Fix: handle $A072 entirely in Python.
-        if op == 0xA072 and pc < 0x8000:
-            tcb_count = bus.read_word(TCB_ADDR + 0x12)
-            if tcb_count > 0:
-                # Read character from buffer at term+$1E
-                rd_ptr = read_long(TCB_ADDR + 0x1E)
-                ch = bus.read_byte(rd_ptr) if rd_ptr < 0x400000 else 0
-                # Update: advance read pointer, decrement count
-                skip_hook = True
-                raw_write_long(TCB_ADDR + 0x1E, rd_ptr + 1)
-                raw_write_word(TCB_ADDR + 0x12, tcb_count - 1)
-                skip_hook = False
-                # Set D1 to the character (byte only, preserve upper bits)
-                cpu.d[1] = (cpu.d[1] & 0xFFFFFF00) | ch
-                cpu.pc = (pc + 2) & 0xFFFFFFFF
-                extra_count += 1
-                continue
-
-        # Non-interactive: halt after INI processing when terminal wait is reached
-        if not INTERACTIVE and op == 0xA03E and (cpu.d[6] & 0xFFFF) == 2 and _amosl_ini_pos > len(_amosl_ini_lines):
-            print(f"\n  >> INI processing complete, system waiting for terminal input. Halting.")
-            cpu.halted = True
-
-        # Interactive mode: inject stdin at $A03E yield points
-        if op == 0xA03E and prompt_count > 0 and (cpu.d[6] & 0xFFFF) == 2:
-            if INTERACTIVE:
-                new_chars = _poll_stdin()
-                if new_chars:
-                    _stdin_buf.extend(new_chars)
-                if _stdin_buf:
-                    _inject_stdin_to_tcb()
-                elif _stdin_eof and bus.read_word(TCB_ADDR + 0x12) == 0:
-                    cpu.halted = True
-                if bus.read_word(TCB_ADDR + 0x12) > 0:
-                    skip_hook = True
-                    raw_write_word(TCB_ADDR + 0x00, 0x0009)
-                    skip_hook = False
-
-    # (diagnostic traces removed — COMINT command processing verified working)
-
-    # === Terminal init trace: $6C6A-$6D20 ===
-    if not INTERACTIVE and disk_io_enabled and 0x6C6A <= pc <= 0x6D20 and extra_count < 5000:
-        try:
-            op = bus.read_word(pc)
-        except:
-            op = 0
-        print(f"  >> TERMINIT [{extra_count}] PC=${pc:06X} op=${op:04X}"
-              f" A0=${cpu.a[0]&0xFFFFFF:06X} A2=${cpu.a[2]&0xFFFFFF:06X}"
-              f" D1=${cpu.d[1]:08X} D7=${cpu.d[7]:08X} SR=${cpu.sr:04X}")
-
-    # === Code path trace: $3700-$37D0 (memory validation area) ===
-    if not INTERACTIVE and disk_io_enabled and 0x3700 <= pc <= 0x37D0 and extra_count < 50000:
-        try:
-            op = bus.read_word(pc)
-        except:
-            op = 0
-        print(f"  >> MEMVAL [{extra_count}] PC=${pc:06X} op=${op:04X}"
-              f" D6=${cpu.d[6]:08X} D1=${cpu.d[1]:08X} A4=${cpu.a[4]&0xFFFFFF:06X}")
-
-    # === COMINT error trace ===
-    if not INTERACTIVE and pc == 0x0068AA and disk_io_enabled and extra_count < 50000:
-        # $68AA: MOVE.W D0,D6 — D0 is the error message number
-        print(f"  >> COMINT ERRMSG at [{extra_count}]: D0=${cpu.d[0]:08X} D6=${cpu.d[6]:08X}"
-              f" A3=${cpu.a[3]:08X} (A3)=${bus.read_word(cpu.a[3] & 0xFFFFFF):04X}"
-              f" A1=${cpu.a[1]:08X}")
-
-    # === Trap-door driver intercept (fallback) ===
-    if pc == TRAPDOOR_ADDR and disk_io_enabled:
-        handle_trapdoor_driver()
-
-    # === COMINT stack relocation ===
-    # Init job SP can be inside the system variable area ($0400-$04FF).
-    # COMINT's MOVEM.L D0-D5/A0-A5,-(SP) pushes 48 bytes below SP,
-    # overwriting JOBCUR ($041C), JOBTBL ($0418), etc. → crash.
-    # Fix: every time COMINT enters at $682E with SP in danger zone,
-    # relocate SP to safe area at $8700 (below MEMBAS=$8800).
-    # Also patch JCB+$80 (saved SP in job control block) so the scheduler
-    # restores SP to the safe area on future dispatches.
-    if pc == 0x00682E and disk_io_enabled:
-        old_sp = cpu.a[7] & 0xFFFFFF
-        if old_sp < 0x8000:  # SP is in danger zone (system area or low RAM)
-            new_sp = INIT_JOB_SP  # Top of init job stack ($8800-$91FF)
-            # Copy exception frame: SR (2 bytes) + PC (4 bytes) = 6 bytes
-            skip_hook = True
-            for i in range(0, 6, 2):
-                w = bus.read_word(old_sp + i)
-                bus.write_word(new_sp + i, w)
-            skip_hook = False
-            cpu.a[7] = (new_sp & 0xFFFFFFFF)
-            # Patch JCB+$80 (saved SP) so scheduler restores to safe area
-            skip_hook = True
-            raw_write_long(DDT_ADDR + 0x80, new_sp)
-            skip_hook = False
-            if not comint_stack_fixed:
-                comint_stack_fixed = True
-                if not INTERACTIVE:
-                    print(f"  >> COMINT STACK FIX: SP ${old_sp:06X} -> ${new_sp:06X}, JCB+$80 patched")
-        # Restore DDT+$0C to dummy module pointer so $A052 returns valid ptr.
-        # (Previously zeroed here, but that caused memory validation failures.)
-        skip_hook = True
-        raw_write_long(DDT_ADDR + 0x0C, DUMMY_MODULE)
-        skip_hook = False
-
-    # === Post-injection tracing ===
-    if not INTERACTIVE and input_injected and extra_count < (inject_at + 5000) if 'inject_at' in dir() else False:
-        try:
-            op2 = bus.read_word(pc)
-        except:
-            op2 = 0
-        pass  # (post-injection trace removed)
-
-    # === Key code path tracking ===
-    if not INTERACTIVE and disk_io_enabled and extra_count < 50000:
-        if pc == 0x00682E:  # COMINT entry
-            sp = cpu.a[7] & 0xFFFFFF
-            # Read exception frame from stack: SR(2) + PC(4)
-            stk_sr = bus.read_word(sp) if sp < 0x400000 else 0
-            stk_pc = read_long(sp + 2) if sp + 2 < 0x400000 else 0
-            print(f"  >> COMINT at {extra_count}: D6=${cpu.d[6]:08X} D0=${cpu.d[0]:08X}"
-                  f" SP=${sp:06X} A6=${cpu.a[6]&0xFFFFFF:06X}"
-                  f" frame:SR=${stk_sr:04X} PC=${stk_pc:08X}"
-                  f" JOBCUR=${read_long(0x041C):08X}")
-        elif pc == 0x001C30:  # SRCH handler
-            print(f"  >> SRCH at {extra_count}")
-        elif pc == 0x002B1C:  # GETMEM handler
-            d1_req = cpu.d[1]
-            membas = read_long(0x0430)
-            mb_next = read_long(membas) if membas < 0x400000 else 0xDEAD
-            mb_size = read_long(membas + 4) if membas + 4 < 0x400000 else 0xDEAD
-            print(f"  >> GETMEM at {extra_count}: req=${d1_req:08X}"
-                  f" MEMBAS=${membas:08X} chain:[next=${mb_next:08X} size=${mb_size:08X}]")
-        elif pc == 0x0012F4:  # $A03C handler (should NOT fire for disk)
-            a0v = cpu.a[0] & 0xFFFFFF
-            ddb08 = read_long(a0v + 0x08) & 0xFFFFFF if 0 < a0v < 0x400000 else 0
-            print(f"  >> $A03C HANDLER at {extra_count}: A0=${a0v:06X} DDB+$08=${ddb08:06X} D6=${cpu.d[6]:08X} (UNEXPECTED!)")
-        elif pc == 0x0011DE:  # $A03E handler
-            a0v = cpu.a[0] & 0xFFFFFF
-            ddb08 = read_long(a0v + 0x08) & 0xFFFFFF if 0 < a0v < 0x400000 else 0
-            print(f"  >> $A03E HANDLER at {extra_count}: A0=${a0v:06X} DDB+$08=${ddb08:06X} D6=${cpu.d[6]:04X}")
-        # Mount code trace ($503C-$506A and callers)
-        elif 0x503C <= pc <= 0x510A:
-            try:
-                op = bus.read_word(pc)
-            except:
-                op = 0
-            a4 = cpu.a[4] & 0xFFFFFF
-            a4_byte = bus.read_byte(a4) if a4 < 0x400000 else -1
-            a4_1f = bus.read_byte(a4 + 0x1F) if a4 + 0x1F < 0x400000 else -1
-            extra_info = ""
-            if pc == 0x503C:
-                sp = cpu.a[7] & 0xFFFFFF
-                stk_top = read_long(sp) if sp < 0x400000 else 0
-                extra_info = f" SP=${sp:06X} (SP)=${stk_top:08X}"
-            elif pc == 0x5042:  # BNE.S $505C — branch check after counter decrement
-                extra_info = f" Z={1 if (cpu.sr & 0x04) else 0} (BNE→{'$505C' if not (cpu.sr & 0x04) else 'fall'})"
-            elif pc == 0x5044:  # TST.B (A4) — test device status
-                extra_info = f" (A4)=${a4_byte:02X} → {'NZ' if a4_byte else 'ZERO'}"
-            elif pc == 0x5046:  # BLE.S $505C — branch if <= 0
-                extra_info = f" N={1 if (cpu.sr & 0x08) else 0} Z={1 if (cpu.sr & 0x04) else 0}"
-            elif pc == 0x505C:  # CLR.L D7
-                extra_info = " (about to check (A4) for error)"
-            elif pc == 0x505E:  # TST.B (A4)
-                extra_info = f" (A4)=${a4_byte:02X}"
-            elif pc == 0x5062:  # MOVEQ #4,D7 — error code
-                extra_info = " ERROR: D7=4 (mount failed)"
-            elif pc == 0x5064:  # MOVEM.L — restore regs
-                extra_info = f" D7=${cpu.d[7]:08X}"
-            elif pc == 0x506A:  # RTE
-                extra_info = f" D7=${cpu.d[7]:08X} (return code)"
-            print(f"  >> MOUNT [{extra_count}] PC=${pc:06X} op=${op:04X}"
-                  f" A4=${a4:06X} (A4)=${a4_byte:02X} A4+$1F=${a4_1f:02X}"
-                  f" D5=${cpu.d[5]:08X}{extra_info}")
-        elif 0x4E00 <= pc <= 0x4E5E:
-            try:
-                op = bus.read_word(pc)
-            except:
-                op = 0
-            print(f"  >> CALLER [{extra_count}] PC=${pc:06X} op=${op:04X}"
-                  f" A0=${cpu.a[0]:08X} A3=${cpu.a[3]:08X} D0=${cpu.d[0]:08X}"
-                  f" D6=${cpu.d[6]:08X}")
-
-    # === ACIA Bypasses ===
-
-    if pc == 0x006C3E:
-        bypass_counts[0x006C3E] += 1
-        cpu.d[1] = 0x02
-        cpu.d[2] = 0x28
-        acia.write(0xFFFFC8, 1, 0x03)
-        acia.write(0xFFFFC8, 1, 0x15)
-        acia._echo_enabled = [False, False, False]
-        cpu.pc = 0x006C5E
-        if not INTERACTIVE and bypass_counts[0x006C3E] <= 3:
-            print(f"  BYPASS terminal detect #{bypass_counts[0x006C3E]}")
-        # Enable disk I/O bypass after first terminal init
-        if not disk_io_enabled:
-            disk_io_enabled = True
-            ddt84_dirty = False  # Reset any stale dirty flag
-            # Check MEMBAS chain integrity
-            mb = read_long(0x0430)
-            mb_next = read_long(mb) if mb < 0x400000 else 0xDEAD
-            mb_size = read_long(mb + 4) if mb < 0x400000 else 0xDEAD
-            if not INTERACTIVE:
-                print(f"  >> DISK I/O BYPASS ENABLED")
-            if not INTERACTIVE:
-                print(f"     MEMBAS=${mb:08X} chain: next=${mb_next:08X} size=${mb_size:08X}")
-        extra_count += 1
-        continue
-
-    if pc == 0x006D80:
-        bypass_counts[0x006D80] += 1
-        a0 = cpu.a[0] & 0xFFFFFF
-        cpu.a[6] = (a0 + 0x0634) & 0xFFFFFFFF
-        for off in range(10):
-            bus.write_byte(a0 + 0x062A + off, 0)
-        bus.write_byte(a0 + 0x0634, 0x03)
-        # Terminal type byte at A0+$0636 — must NOT be 6 (retry code).
-        # Use $02 for standard terminal. This is checked at $6C7A.
-        bus.write_byte(a0 + 0x0636, 0x02)
-        bus.write_byte(a0 + 0x0638, 0x0C)
-        acia.write(0xFFFFC8, 1, 0x15)
-        acia._tdre[0] = True
-        acia._tsr_active[0] = False
-        acia._tdr_full[0] = False
-        acia._rx_cooldown[0] = 0
-        acia._echo_pending[0].clear()
-        ret_addr = read_long(cpu.a[7] & 0xFFFFFF)
-        cpu.a[7] = (cpu.a[7] + 4) & 0xFFFFFFFF
-        cpu.pc = ret_addr
-        # Real handshake returns with MOVE #4,CCR (Z=1, all others clear).
-        # Must set Z=1 so BNE at $6C6A falls through to terminal init.
-        cpu.sr = (cpu.sr & 0xFF00) | 0x04  # CCR = Z=1
-        if not INTERACTIVE and bypass_counts[0x006D80] <= 3:
-            print(f"  BYPASS handshake #{bypass_counts[0x006D80]} -> ${ret_addr:06X} (Z=1)"
-                  f" A0=${a0:06X} A5=${cpu.a[5]&0xFFFFFF:06X}"
-                  f" A0+$636=${bus.read_byte(a0+0x636):02X}")
-        extra_count += 1
-        continue
-
-    if pc == 0x006BDE:
-        bypass_counts[0x006BDE] += 1
-        cpu.d[7] = 0x16
-        cpu.pc = 0x006BEC
-        extra_count += 1
-        continue
-
-    if pc == 0x006D9C:
-        bypass_counts[0x006D9C] += 1
-        cpu.d[7] = 0x0E
-        cpu.pc = 0x006DAA
-        extra_count += 1
-        continue
-
-    if pc == 0x006B68:
-        bypass_counts[0x006B68] += 1
-        if (acia._control[0] & 0x03) != 0x03:
-            cpu.pc = 0x006B70
-            extra_count += 1
-            continue
-
-    # LINE-A $A00A intercept — direct character output
-    if pc == 0x002AB0:
-        a00a_intercepts += 1
-        d1 = cpu.d[1] & 0x7F
-        banner_chars.append(d1)
-        if INTERACTIVE:
-            if d1 == 0x0A:
-                sys.stdout.buffer.write(b'\r\n')
-            elif d1 == 0x0D:
-                sys.stdout.buffer.write(b'\r')
-            elif d1 >= 0x20:
-                sys.stdout.buffer.write(bytes([d1]))
-            sys.stdout.buffer.flush()
+        # Loop detection
+        if pc == last_pc:
+            stuck_count += 1
+            if stuck_count >= 10000:
+                key = f"loop_{pc:06X}"
+                bypass_counts[key] += 1
+                if bypass_counts[key] <= 3:
+                    try:
+                        dis, _ = disassemble_one(bus, pc)
+                    except:
+                        dis = "???"
+                    print(f"  LOOP BREAK ${pc:06X}: {dis}", flush=True, file=sys.stderr)
+                    print(f"    D0-D3: ${cpu.d[0]:08X} ${cpu.d[1]:08X} ${cpu.d[2]:08X} ${cpu.d[3]:08X}", flush=True, file=sys.stderr)
+                    print(f"    A0-A3: ${cpu.a[0]:08X} ${cpu.a[1]:08X} ${cpu.a[2]:08X} ${cpu.a[3]:08X}", flush=True, file=sys.stderr)
+                cpu.d[7] = cpu.d[7] | 0xFF
+                stuck_count = 0
         else:
-            acia.write(0xFFFFC9, 1, d1)
-            if a00a_intercepts <= 100:
-                sp = cpu.a[7] & 0xFFFFFF
-                rets = []
-                for ri in range(0, 24, 4):
-                    rv = read_long(sp + ri) if sp + ri < 0x400000 else 0
-                    rets.append(f"${rv:06X}")
-                ch = chr(d1) if 0x20 <= d1 < 0x7F else '.'
-                print(f"  $A00A [{extra_count}] '{ch}' (${d1:02X}) SP=${sp:06X} stack={','.join(rets[:4])}")
-            if a00a_intercepts == 1:
-                mb = read_long(0x0430)
-                mb_n = read_long(mb) if 0 < mb < 0x400000 else 0xDEAD
-                mb_s = read_long(mb + 4) if 0 < mb < 0x400000 else 0xDEAD
-                print(f"    ** MEMBAS at first $A00A: ${mb:08X} next=${mb_n:08X} size=${mb_s:08X}")
-                print(f"    ** D0-D7: " + " ".join(f"${cpu.d[i]:08X}" for i in range(8)))
-                print(f"    ** A0-A7: " + " ".join(f"${cpu.a[i]:08X}" for i in range(8)))
-                sp = cpu.a[7] & 0xFFFFFF
-                for si in range(0, 64, 2):
-                    w = bus.read_word(sp + si)
-                    print(f"    ** SP+${si:02X}: ${w:04X}", end="")
-                print()
-        cpu.pc = 0x002AB2
-        extra_count += 1
-        continue
+            stuck_count = 0
+            last_pc = pc
 
-    # === Driver tracking ===
-    if not INTERACTIVE and (DRIVER_RAM <= pc < DRIVER_END or pc == CANTMR_DST or pc == CLRCDB_DST):
-        if DRIVER_RAM <= pc < DRIVER_END and (last_driver_pc is None or
-            not (DRIVER_RAM <= last_driver_pc < DRIVER_END)):
-            driver_entries += 1
-            if driver_entries <= 10:
-                off = pc - DRIVER_RAM
-                print(f"\n  DRIVER entry #{driver_entries} at PC=${pc:06X} (+${off:04X})")
-                print(f"    D0=${cpu.d[0]:08X} D1=${cpu.d[1]:08X} A0=${cpu.a[0]:08X}")
-                print(f"    A4=${cpu.a[4]:08X} A5=${cpu.a[5]:08X} SR=${cpu.sr:04X}")
-        last_driver_pc = pc
-    else:
-        last_driver_pc = pc
+        if pc >= 0x100000 and pc < 0x800000:
+            print(f"\n*** CRASH at ${pc:06X} ***", flush=True, file=sys.stderr)
+            print(f"  A7=${cpu.a[7]:08X} SR=${cpu.sr:04X}", flush=True, file=sys.stderr)
+            break
 
-    cpu.step()
-    bus.tick(1)
-    extra_count += 1
+        if step > 0 and step % 5_000_000 == 0:
+            print(f"\n  [step {step:,}] PC=${pc:06X} JOBCUR=${bus.read_long(0x041C):08X}", flush=True, file=sys.stderr)
+            print(f"  Bypasses: {dict(bypass_counts)}", flush=True, file=sys.stderr)
 
-    if not INTERACTIVE and extra_count % 5_000_000 == 0:
-        print(f"\n  Progress: {count + extra_count} instrs, PC=${cpu.pc:06X}, "
-              f"disk_io={disk_io_count}, driver={driver_entries}, banner={len(banner_chars)}")
+        cycles = cpu.step()
+        bus.tick(cycles)
+        step += 1
 
-# Restore terminal before printing results
-_restore_terminal()
+except KeyboardInterrupt:
+    print(f"\n*** Interrupted at step {step:,} ***", flush=True, file=sys.stderr)
+except Exception as e:
+    print(f"\n*** Exception at step {step:,}: {e} ***", flush=True, file=sys.stderr)
+    import traceback
+    traceback.print_exc()
 
-# ─── Results ───
-if not INTERACTIVE:
-    print(f"\n{'='*60}")
-    print("RESULTS")
-    print(f"{'='*60}")
-    print(f"  Total: {count + extra_count} instructions")
-    print(f"  Disk I/O ops: {disk_io_count} (DDT+$84), {a03e_count} ($A03E)")
-    print(f"  Driver entries: {driver_entries}")
-    print(f"  $A00A intercepts: {a00a_intercepts}")
-    print(f"  $A006 intercepts: {a006_count}")
-    print(f"  Prompts seen: {prompt_count}, Input injections: {prompt_count if input_injected else prompt_count - 1}")
-    print(f"  Bypasses: C3E={bypass_counts[0x006C3E]} D80={bypass_counts[0x006D80]} "
-          f"BDE={bypass_counts[0x006BDE]} D9C={bypass_counts[0x006D9C]} B68={bypass_counts[0x006B68]}")
+print(f"\nFinal: step {step:,} PC=${cpu.pc:06X}", flush=True, file=sys.stderr)
+print(f"Bypasses: {dict(bypass_counts)}", flush=True, file=sys.stderr)
+print(f"MEMBAS=${bus.read_long(0x0430):08X} JOBCUR=${bus.read_long(0x041C):08X}", flush=True, file=sys.stderr)
 
-    # Final state
-    print(f"\n  DDT+$84 = ${read_long(DDT_STATUS):08X}")
-    print(f"  DDT+$78 = ${read_long(DDT_QUEUE):08X}")
-    print(f"  JOBCUR = ${read_long(0x041C):08X}")
+# Check disk state
+zsydsk = bus.read_long(0x040C)
+print(f"ZSYDSK=${zsydsk:08X}", flush=True, file=sys.stderr)
+if zsydsk and zsydsk < 0x100000:
+    dkflg = bus.read_byte(zsydsk)
+    print(f"DK.FLG=${dkflg:02X}", flush=True, file=sys.stderr)
 
-    if cpu.halted:
-        print(f"  CPU HALTED at PC=${cpu.pc:06X}")
-    else:
-        print(f"  Final PC=${cpu.pc:06X}")
-        # Dump code at final PC
-        print(f"\n  Code at final PC:")
-        for addr in range(cpu.pc - 8, cpu.pc + 16, 2):
-            w = bus.read_word(addr)
-            m = " <-- PC" if addr == cpu.pc else ""
-            print(f"    ${addr:06X}: ${w:04X}{m}")
-        # Check stack
-        sp = cpu.a[7] & 0xFFFFFF
-        print(f"\n  Stack at SP=${sp:06X}:")
-        for i in range(0, 16, 2):
-            w = bus.read_word(sp + i)
-            print(f"    ${sp + i:06X}: ${w:04X}")
-        print(f"\n  Registers:")
-        for i in range(8):
-            print(f"    D{i}=${cpu.d[i]:08X}  A{i}=${cpu.a[i]:08X}")
-else:
-    print(f"\r\n\r\n[Session ended: {count + extra_count} instructions, {prompt_count} prompts]")
+# Dump captured output chars
+print(f"\n=== Output chars ({len(output_chars)} total) ===", flush=True, file=sys.stderr)
+post_comint = [c for c in output_chars if c[2]]
+# Show all post-COMINT chars with their LINE-A opcode
+from collections import defaultdict
+# Group by opcode — show which opcode has the text
+opcode_chars = defaultdict(list)
+for step_n, ch, _, opcode_n in post_comint:
+    if ch >= 0x20 and ch < 0x7F:
+        opcode_chars[opcode_n].append(chr(ch))
 
-if not INTERACTIVE:
-    if banner_chars:
-        text = bytes(banner_chars).decode('ascii', errors='replace')
-        printable = ''.join(c if (0x20 <= ord(c) < 0x7F or c in '\r\n') else '.' for c in text)
-        print(f"\n  Banner text ({len(banner_chars)} chars):")
-        for line in printable.split('\n')[:30]:
-            if line.strip():
-                print(f"    {line.rstrip()}")
-
-    if a006_chars:
-        text = bytes(a006_chars).decode('ascii', errors='replace')
-        printable = ''.join(c if (0x20 <= ord(c) < 0x7F or c in '\r\n') else '.' for c in text)
-        print(f"\n  $A006 output ({len(a006_chars)} chars):")
-        for line in printable.split('\n')[:30]:
-            print(f"    {line.rstrip()}")
-
-    print(f"\nDone!")
+print(f"Post-COMINT text by LINE-A opcode:", flush=True, file=sys.stderr)
+for op in sorted(opcode_chars.keys()):
+    text = "".join(opcode_chars[op])
+    print(f"  ${op:04X} ({len(opcode_chars[op])} chars): {text!r}", flush=True, file=sys.stderr)

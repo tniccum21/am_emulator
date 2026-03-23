@@ -62,8 +62,14 @@ class MC68010:
         # Trace callback (set by debug module)
         self.trace_hook = None
 
-        # Debug flag: use 68000-style 6-byte exception frames instead of 68010 8-byte
-        self.use_68000_frames: bool = False
+        # Use 68000-style exception frames.  The AM-1200 ROM exception
+        # handlers (bus error at $F916/$0AFA, etc.) use hard-coded stack
+        # offsets that assume 68000 frame layout.  With 68010 format $0
+        # or format $8 frames the handlers read SR/PC from wrong offsets
+        # and crash.  Setting this True makes all exceptions push 68000-
+        # style frames (6-byte normal, 14-byte bus error) and RTE pop
+        # only SR+PC (6 bytes).
+        self.use_68000_frames: bool = True
 
     # ── Status register helpers ──────────────────────────────────────
 
@@ -304,21 +310,40 @@ class MC68010:
         if self.trace_hook:
             self.trace_hook(self)
 
-        # Fetch opcode word
-        opword = self.fetch_word()
+        # Save instruction PC before fetch (needed for bus error frame)
+        instruction_pc = self.pc
 
-        # Dispatch
-        if self.opcode_table:
-            handler = self.opcode_table[opword]
-            if handler is not None:
-                cost = handler(self, opword)
-                self.cycles += cost
-                return cost
+        # Fetch and execute — catch bus errors from any memory access
+        from ..bus.memory_bus import BusError
+        try:
+            # Fetch opcode word
+            opword = self.fetch_word()
 
-        # Unimplemented opcode — trigger illegal instruction exception
-        self.pc = (self.pc - 2) & 0xFFFFFF  # back up PC to point at bad opcode
-        from .exceptions import execute_exception
-        execute_exception(self, 4)  # vector 4 = illegal instruction
-        cost = 34
-        self.cycles += cost
-        return cost
+            # Dispatch
+            if self.opcode_table:
+                handler = self.opcode_table[opword]
+                if handler is not None:
+                    cost = handler(self, opword)
+                    self.cycles += cost
+                    return cost
+
+            # Unimplemented opcode — trigger illegal instruction exception
+            self.pc = (self.pc - 2) & 0xFFFFFF  # back up PC to point at bad opcode
+            from .exceptions import execute_exception
+            execute_exception(self, 4)  # vector 4 = illegal instruction
+            cost = 34
+            self.cycles += cost
+            return cost
+
+        except BusError as e:
+            from .exceptions import execute_bus_error
+            # Use current PC (past fetched words), not instruction_pc.
+            # The AM-1200 ROM/OS bus error handlers were written for 68000
+            # where bus error does NOT restart the faulted instruction —
+            # the stacked PC points past the instruction.  Using the
+            # already-advanced PC matches that expectation and prevents
+            # infinite restart loops (e.g. ROM checksum scan past ROM end).
+            execute_bus_error(self, e.address, e.is_write, self.pc)
+            cost = 126  # approximate bus error exception processing cycles
+            self.cycles += cost
+            return cost

@@ -84,6 +84,95 @@ def execute_exception(cpu: MC68010, vector_number: int,
     cpu.stopped = False
 
 
+def execute_bus_error(cpu: MC68010, fault_address: int, is_write: bool,
+                      instruction_pc: int) -> None:
+    """Process a bus error exception with 68000-style stack frame.
+
+    Always uses the 68000 14-byte bus error frame layout regardless of the
+    use_68000_frames flag.  The AM-1200 ROM bus error handlers (both the
+    generic handler at $0AFA and custom handlers like the ROM checksum scan
+    at $F916) were written for the 68000 frame layout and use hard-coded
+    stack offsets (e.g. ADDA #$18,A7) that assume the 14-byte format.
+
+    The 68010 format $8 (58-byte) bus error frame would place SR, PC, and
+    format/vector at completely different offsets, causing the ROM handlers
+    to restore garbage and crash.
+
+    68000 bus error frame (14 bytes, pushed high-to-low):
+        SP+10: PC (longword)
+        SP+8:  SR (word)
+        SP+6:  instruction register (word)
+        SP+2:  fault address (longword)
+        SP+0:  R/W + function code (word)
+
+    Args:
+        cpu: CPU instance.
+        fault_address: The address that caused the bus error.
+        is_write: True if the faulting access was a write.
+        instruction_pc: PC of the instruction that caused the fault.
+    """
+    # Disable bus errors during frame push to prevent double-fault recursion
+    cpu.bus.bus_error_enabled = False
+
+    old_sr = cpu.sr
+
+    # Switch to supervisor mode
+    if not cpu.supervisor:
+        cpu.usp = cpu.a[7]
+        cpu.sr |= SR_SUPER
+        cpu.a[7] = cpu.ssp
+
+    cpu.sr &= ~SR_TRACE
+
+    vector_number = 2  # bus error
+
+    # Always use 68000-style 14-byte bus error frame.
+    # Push order: PC first (highest address), then SR, instruction
+    # register, access address, and finally R/W+FC (lowest address).
+    #
+    # Resulting stack layout:
+    #   SP+0:  R/W + function code (word)
+    #   SP+2:  Access address (longword)
+    #   SP+6:  Instruction register (word)
+    #   SP+8:  Status register (word)
+    #   SP+10: Program counter (longword)
+
+    # 1. PC (longword) — goes to SP+10
+    cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
+    cpu.bus.write_long(cpu.a[7], instruction_pc & 0xFFFFFFFF)
+
+    # 2. SR (word) — goes to SP+8
+    cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
+    cpu.bus.write_word(cpu.a[7], old_sr)
+
+    # 3. Instruction register (word) — goes to SP+6
+    cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
+    cpu.bus.write_word(cpu.a[7], 0)
+
+    # 4. Access address (longword) — goes to SP+2
+    cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
+    cpu.bus.write_long(cpu.a[7], fault_address & 0xFFFFFFFF)
+
+    # 5. R/W + function code word — goes to SP+0
+    rw_fc = 0x0005  # supervisor data
+    if is_write:
+        rw_fc &= ~0x0010  # R/W bit clear = write
+    else:
+        rw_fc |= 0x0010  # R/W bit set = read
+    cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
+    cpu.bus.write_word(cpu.a[7], rw_fc)
+
+    # Read new PC from vector table
+    vector_addr = (cpu.vbr + vector_number * 4) & 0xFFFFFFFF
+    new_pc = cpu.bus.read_long(vector_addr)
+    cpu.pc = new_pc & 0xFFFFFF
+
+    cpu.stopped = False
+
+    # Re-enable bus errors now that frame is complete
+    cpu.bus.bus_error_enabled = True
+
+
 def execute_rte(cpu: MC68010) -> int:
     """Execute RTE (Return from Exception).
 
@@ -107,10 +196,14 @@ def execute_rte(cpu: MC68010) -> int:
         format_vector = cpu.bus.read_word(cpu.a[7])
         cpu.a[7] = (cpu.a[7] + 2) & 0xFFFFFFFF
 
-        # Verify format nibble (top 4 bits) = 0 (short frame)
         frame_format = (format_vector >> 12) & 0xF
-        if frame_format != 0:
-            # Format error — trigger format error exception (vector 14)
+        if frame_format == 0:
+            pass  # short frame — nothing more to pop
+        elif frame_format == 0x8:
+            # Bus error long frame: skip remaining 50 bytes (25 words)
+            cpu.a[7] = (cpu.a[7] + 50) & 0xFFFFFFFF
+        else:
+            # Unknown format — trigger format error exception (vector 14)
             execute_exception(cpu, 14)
             return 50
 

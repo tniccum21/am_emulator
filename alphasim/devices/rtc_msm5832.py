@@ -27,6 +27,7 @@ class RTC_MSM5832(IODevice):
 
     def __init__(self):
         self._command: int = 0  # last command byte written to $FFFE04
+        self._hold_active: bool = False
         # Internal BCD registers (writable by OS for SET DATE)
         self._regs: list[int] = [0] * 14
         self._sync_from_host()
@@ -62,10 +63,15 @@ class RTC_MSM5832(IODevice):
     def write(self, address: int, size: int, value: int) -> None:
         addr = address & 0xFFFFFF
         if addr == 0xFFFE04:
-            self._command = value & 0xFF
-            # On HOLD assertion, snapshot host time
-            if value & 0x40:
+            new_command = value & 0xFF
+            new_hold = bool(new_command & 0x40)
+            # Snapshot host time only on HOLD 0->1 transition. Repeated
+            # command writes while HOLD stays asserted must not keep changing
+            # the visible registers mid-read sequence.
+            if new_hold and not self._hold_active:
                 self._sync_from_host()
+            self._hold_active = new_hold
+            self._command = new_command
         elif addr == 0xFFFE05:
             # Write data to selected register (SET DATE/TIME)
             reg = self._command & 0x0F

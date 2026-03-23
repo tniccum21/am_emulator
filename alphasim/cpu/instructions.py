@@ -1692,7 +1692,17 @@ def op_line_a(cpu: MC68010, opword: int) -> int:
 
 
 def op_line_f(cpu: MC68010, opword: int) -> int:
-    """Line-F emulator trap (vector 11)."""
+    """Line-F emulator trap (vector 11).
+
+    68040 cache instructions (CPUSHA, CINVA, etc.) appear as LINE-F
+    on 68010.  The AMOS .MON is compiled for 68040 and uses these
+    for cache management.  Treat them as NOPs since 68010 has no
+    data cache — avoids triggering the OS LINE-F exception handler
+    which doesn't handle cache opcodes correctly.
+    """
+    # 68040 cache instructions: $F4xx range (CPUSHA, CINVA, CPUSHP, etc.)
+    if (opword & 0xFF00) == 0xF400:
+        return 4  # NOP — no cache to flush/invalidate
     cpu.pc = (cpu.pc - 2) & 0xFFFFFF
     execute_exception(cpu, 11)
     return 34

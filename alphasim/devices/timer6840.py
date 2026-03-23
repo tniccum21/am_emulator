@@ -186,10 +186,22 @@ class Timer6840(IODevice):
         if reg == 0:
             # CR1 or CR3 (selected by CR2 bit 0)
             if self._cr2 & 0x01:
+                old_cr1 = self._cr1
                 self._cr1 = value
                 self._trace(f"CR1 = ${value:02X}")
                 # CR1 bit 0: timer system preset. 0 = counting, 1 = held/reset
-                self._timers_enabled = not bool(value & 0x01)
+                # On 1→0 transition: simultaneously load all counters from latches
+                was_preset = bool(old_cr1 & 0x01)
+                now_preset = bool(value & 0x01)
+                if was_preset and not now_preset:
+                    for i in range(3):
+                        self._counter[i] = self._latch[i]
+                        self._irq_flag[i] = False
+                        self._clearing_armed[i] = False
+                    self._cycle_accum = 0
+                    self._trace(f"Preset release: counters loaded from latches "
+                                f"[${self._latch[0]:04X}, ${self._latch[1]:04X}, ${self._latch[2]:04X}]")
+                self._timers_enabled = not now_preset
             else:
                 self._cr3 = value
                 self._trace(f"CR3 = ${value:02X}")
