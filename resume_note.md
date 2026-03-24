@@ -5,6 +5,71 @@ Branch: `feature/native-boot-milestones`
 
 ## Latest Checkpoint
 
+The native timer/wake source is no longer an unresolved mystery. The loaded
+monitor is actively using a second PIT-style timer block at
+`$FFFE60-$FFFE67`, not just the MC6840 PTM at `$FFFE10-$FFFE1F`.
+
+What is now implemented in code:
+
+- `alphasim/devices/timer8253.py` adds the minimal native timer block the
+  monitor actually touches:
+  - counter/data ports at `$FFFE60`, `$FFFE62`, `$FFFE64`
+  - control/latch writes at `$FFFE61`, `$FFFE63`, `$FFFE66`
+  - level-6 autovectored interrupt support for the native timer path
+- the device is wired in `alphasim/main.py`
+- direct regressions now cover:
+  - `tests/devices/test_timer8253.py`
+  - `tests/integration/test_boot_native_pit_irq.py`
+  - `tests/cpu/test_rte.py`
+
+What the new trace work proved before the patch:
+
+- the live delayed-queue path does **not** arm `$FFFE13` on this image
+- at `$0019A8`, the native path sees `($0403).W = $A4`, takes `BMI $0019D8`,
+  and programs `$FFFE62/$FFFE63` instead
+- the vector-30 ISR at `$0018E0` also branches to `$001944` on this path and
+  acknowledges `$FFFE60/$FFFE61`, confirming the MC6840-only theory was wrong
+- the monitor also initializes the same block near `$00F182` with:
+  - `$FFFE66 <- $B6`
+  - `$FFFE64 <- $14`, `$00`
+  - `$FFFE66 <- $30`, `$FFFE61 <- $00`
+  - `$FFFE66 <- $70`, `$FFFE63 <- $00`
+
+What this changes in practice:
+
+- clean native `cpu_model=68020` boot now reaches the native level-6 handler
+  at `$0018E0`
+- the old `$001C90/$001CAC` idle-loop frontier is gone
+- the run reaches later loaded-monitor code at:
+  - `$001DBE` by about `4,043,337` instructions
+  - and then `$001EB2` by `8,000,000` instructions
+- by that later point:
+  - `QHEAD = $00000000`
+  - `EVBUSY = $0000`
+  - `JOBCUR = $0000A86E`
+  - LED history remains `06 0B 00 0E 0F 00`
+
+Important continuity note:
+
+- the old boot-shaped low-memory SCSI milestone tests are now stale because
+  the native PIT wake path bypasses that previous dead-end
+- those boot milestones were retired and replaced with:
+  - direct device coverage in `tests/devices/test_scsi_bus.py`
+  - direct RTE-helper coverage in `tests/cpu/test_rte.py`
+  - native PIT boot coverage in `tests/integration/test_boot_native_pit_irq.py`
+
+Current verification baseline:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/cpu/test_rte.py tests/devices/test_scsi_bus.py tests/devices/test_timer6840.py tests/devices/test_timer8253.py tests/integration/test_boot_native_cpu_probe.py tests/integration/test_boot_native_pit_irq.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration -k 'not test_native_boot_reads_amosl_ini_before_terminal_output'
+```
+
+Latest results:
+
+- focused PIT/native subset: `13 passed`
+- broader integration subset: `22 passed, 1 skipped, 1 deselected`
+
 The post-SCSI native frontier is now narrowed further than the earlier
 `JCB+$78` theory: the live blocker is the delayed-event queue/timer wake path,
 not a missing successor-job link.

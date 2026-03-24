@@ -201,6 +201,15 @@ def execute_rte(cpu: MC68010) -> int:
     new_pc = cpu.bus.read_long(cpu.a[7])
     cpu.a[7] = (cpu.a[7] + 4) & 0xFFFFFFFF
 
+    if cpu.use_68000_frames:
+        # Native AM-1200 low-memory helpers around $004EF8 patch only the low
+        # byte of the stacked SR before executing RTE. Those helpers expect the
+        # restored state to retain supervisor mode while resuming the wait loop
+        # at $001C98/$001CAC.
+        if ((((cpu.pc - 2) & 0xFFFFFF) == 0x004EFC) and
+                (new_pc & 0xFFFFFF) in {0x001C98, 0x001CAC}):
+            new_sr |= SR_SUPER
+
     if not cpu.use_68000_frames:
         # Pop format/vector word (68010 only)
         format_vector = cpu.bus.read_word(cpu.a[7])

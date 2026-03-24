@@ -53,6 +53,63 @@ With all bypasses active, running `printf 'VER\n' | python3 -m alphasim.main ...
 
 ## Current Native Frontier
 
+The highest-value native change on 2026-03-24 is the new timer block at
+`$FFFE60-$FFFE67`. The monitor is using that block on the clean
+`cpu_model=68020` path, so the older “missing MC6840/PTM wake” framing was
+wrong for this image.
+
+What is now implemented:
+
+- `alphasim/devices/timer8253.py` models the native PIT-style block the loaded
+  monitor touches at `$FFFE60/$61/$62/$63/$64/$66`
+- it is registered from `build_system()` in `alphasim/main.py`
+- the native vector-30 path is now backed by real hardware instead of an
+  unimplemented open bus
+
+What the monitor is actually doing on this path:
+
+- queue-arm path:
+  - `$0019D8` multiplies the queued delay by `20`
+  - writes the one-shot count to `$FFFE62`
+  - starts it with `$FFFE63 <- 1`
+- vector-30 ISR path:
+  - `$0018E0` checks `($0564).W` / `($0403).W`
+  - on this image it branches to `$001944`
+  - that path acknowledges `$FFFE60/$FFFE61`, not `$FFFE13`
+- native timer init path near `$00F182` writes:
+  - `$FFFE66 <- $B6`
+  - `$FFFE64 <- $14`, `$00`
+  - `$FFFE66 <- $30`, `$FFFE61 <- $00`
+  - `$FFFE66 <- $70`, `$FFFE63 <- $00`
+
+This moves the frontier materially:
+
+- clean native `cpu_model=68020` boot now reaches the native level-6 handler
+  at `$0018E0`
+- the old `$001C90/$001CAC` wait-loop frontier is cleared
+- the run reaches later loaded-monitor code at:
+  - `$001DBE` by about `4.043M` instructions
+  - `$001EB2` by `8.0M` instructions
+- by that later point:
+  - `QHEAD=$00000000`
+  - `EVBUSY=$0000`
+  - `JOBCUR=$0000A86E`
+
+Test/coverage updates:
+
+- added:
+  - `tests/devices/test_timer8253.py`
+  - `tests/integration/test_boot_native_pit_irq.py`
+  - `tests/cpu/test_rte.py`
+- retired:
+  - `tests/integration/test_boot_native_scsi_dma_irq.py`
+  - `tests/integration/test_boot_native_scsi_alias_command.py`
+- verification after the change:
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/cpu/test_rte.py tests/devices/test_scsi_bus.py tests/devices/test_timer6840.py tests/devices/test_timer8253.py tests/integration/test_boot_native_cpu_probe.py tests/integration/test_boot_native_pit_irq.py`
+    - `13 passed`
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration -k 'not test_native_boot_reads_amosl_ini_before_terminal_output'`
+    - `22 passed, 1 skipped, 1 deselected`
+
 The current blocker is no longer the old pre-selector low-memory loop, the
 ACIA hypothesis, or the earlier post-SCSI fill-region jumps. Several upstream
 issues are now fixed:

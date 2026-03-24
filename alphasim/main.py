@@ -23,6 +23,7 @@ from .devices.sasi import SASIController
 from .devices.acia6850 import ACIA6850
 from .devices.primary_serial_setup import PrimarySerialSetup
 from .devices.timer6840 import Timer6840
+from .devices.timer8253 import Timer8253
 from .devices.rtc_direct_bank import RTCDirectBank
 from .devices.rtc_msm5832 import RTC_MSM5832
 from .devices.scsi_bus import SCSIBusInterface
@@ -66,6 +67,10 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     # MC6840 PTM timer at $FFFE10-$FFFE1F (odd byte addresses)
     timer = Timer6840()
     bus.register_device(0xFFFE10, 0xFFFE1F, timer)
+
+    # Native AMOSL.MON also uses a separate PIT-style timer block here.
+    timer_native = Timer8253()
+    bus.register_device(0xFFFE60, 0xFFFE67, timer_native)
 
     # SCSI bus interface at $FFFFC8-$FFFFC9 (used by OS driver SCZ.DVR)
     scsi_bus = SCSIBusInterface()
