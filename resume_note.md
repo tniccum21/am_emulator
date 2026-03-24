@@ -5,81 +5,68 @@ Branch: `feature/native-boot-milestones`
 
 ## Latest Checkpoint
 
-The next real native bug after the SCSI DMA level fix was not SCSI anymore;
-it was later privilege/trace exception return flow in loaded RAM.
+The post-SCSI native frontier is now narrowed further than the earlier
+`JCB+$78` theory: the live blocker is the delayed-event queue/timer wake path,
+not a missing successor-job link.
 
-Two closely related emulator fixes are now in place:
+What still holds from the last code fix:
 
-- privilege-violation handlers in `alphasim/cpu/instructions.py` now pass the
-  faulting opcode PC via `pc_override=(cpu.pc - 2) & 0xFFFFFF`
-- the synthetic 68000-style exception-frame compatibility rule in
-  `alphasim/cpu/exceptions.py` now uses the alternate `[PC][SR]` layout for
-  vectors **8**, **9**, and **26**
+- privilege-violation handlers now stack the faulting opcode PC
+- the synthetic 68000-style compatibility frame for vectors 8/9/26 matches
+  the monitor helpers well enough to eliminate the older bogus jumps to
+  `$190000`, `$083A10`, and `$1784B6`
+- the first vector-26 helper still returns to `PC=$001C98`, `SR=$0019`
 
-Why this was necessary:
+What the new queue trace proves on the clean native `cpu_model=68020` path:
 
-- after the first corrected vector-26 return, native code reaches
-  `$001CAC: MOVE.W #$2700,SR`
-- because the helper restored `SR=$0019`, that instruction must fault with
-  privilege violation vector 8
-- the old emulator path stacked the already-advanced PC, so vector 8 saw
-  `$001CAE` (the immediate word `2700`) instead of the faulting opcode at
-  `$001CAC`
-- the later helper at `$004EF8/$004EFC` also expects the same alternate
-  compatibility frame order already proven for vector 26
+- the first scheduler dequeue at `$001C48/$001C4C` still clears:
+  - `JOBCUR = $0000A86E -> 0`
+  - `JCB+$78 = $00000000`
+- but that is no longer the best causal frontier
+- the machine also has a live delayed-event queue:
+  - `$001A2A` writes `($042A).L = $00007BC2`
+  - `$001980` sets `($046E).W = $00FF`
+- the queued block at `$7BC2` is not the older `$1B00` callback node:
+  - `link = $00000000`
+  - `delay = $0000C350`
+  - `callback = $00000000`
+  - `owner = $00000000`
+- that block comes directly from the loaded monitor's `$00A2F0` path, which
+  seeds the work area and then queues it
 
-The new regression coverage is:
+The important negative findings are now:
 
-- native low-memory DMA IRQ still acknowledges as vector 26 and returns to
-  `PC=$001C98`, `SR=$0019`
-- a second regression now proves the later helper returns to the faulting
-  `MOVE.W #$2700,SR` at:
-  - `PC = $001CAC`
-  - `SR = $0019`
+- by `8,000,000` instructions, none of the timeout-service PCs are reached:
+  - `$001902`
+  - `$001910`
+  - `$001920`
+  - `$001924`
+  - `$00227C`
+  - `$002280`
+- the queue-consumer/callback side also never runs in that window:
+  - `$00199C`
+  - `$001B00`
+  - `$001D10`
+  - `$001D80`
+  - `$001D86`
+- the queued delay value at `$7BC6` stays unchanged at `$0000C350`
+- after the first dequeue, the machine sits in the idle/wait loop around
+  `$001C90/$001CAC` with:
+  - `QHEAD = $00007BC2`
+  - `EVBUSY = $00FF`
+  - `WAKE0 = $0000`
+  - no new interrupt taken in the open interrupt window at `$001C94`
 
-This removes the earlier bogus fill-region frontier:
+So the next real target is now:
 
-- the old bad jumps to `PC=$190000`, `PC=$083A10`, and later `PC=$1784B6`
-  are no longer the first blockers on the clean native `cpu_model=68020` path
-- an `8,000,000` instruction probe now instead ends in a later corrupted
-  state around:
-  - `PC = $002584`
-  - `SR = $2008`
-  - `JOBCUR = $FFFFFE60`
-  - `DRVVEC = $00190019`
-  - `SYSTEM = $0000FFFF`
+- what periodic source is supposed to service/decrement the queued block at
+  `$7BC2`
+- why the native timeout-service path never runs before the later low-memory
+  corruption at `pc=$002584`
 
-But that end state is no longer the highest-value frontier. The first concrete
-corruption is now much earlier in the scheduler:
+For continuity, the current queue trace is preserved in:
 
-- live code at `$001C44` is:
-  - `LEA.L $78(A0),A3`
-  - `MOVE.L (A3),$041C.W`
-  - `CLR.L (A3)+`
-- at `PC=$001C48/$001C4C`, the active JCB is still sane:
-  - `JOBCUR = $0000A86E`
-  - `SYSTEM = $0030A404`
-  - `DRVVEC = $0000632C`
-- but `JCB+$78` at `$A8E6` is still zero, so the scheduler loads zero into
-  `$041C` and clears the current job chain
-
-Direct evidence for the new blocker:
-
-- `JCB+$78` never becomes nonzero on the traced native path
-- the only observed writes to `$A8E6-$A8E9` are zero writes from:
-  - `PC = $032870`
-  - `PC = $033186`
-  - `PC = $00F05E`
-  - `PC = $001C4E`
-- related scheduler/link code also exists at:
-  - `$001D80: MOVE.L $041C.W,$78(A0)`
-  - `$001D86: MOVE.L A0,$041C.W`
-
-So the next real target is no longer exception-frame recovery. It is now:
-
-- who is supposed to link the successor job into `JOBCUR+$78`
-- why no producer ever makes `JCB+$78` at `$A8E6` nonzero before the scheduler
-  reaches `$001C48/$001C4C`
+- `trace_native_delay_queue.py`
 
 ## Where We Left Off
 

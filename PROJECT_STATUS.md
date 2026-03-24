@@ -117,30 +117,32 @@ downstream native bugs were still distorting the control flow:
 Those corrections remove the earlier bogus jumps to fill regions around
 `PC=$190000`, `PC=$083A10`, and `PC=$1784B6`.
 
-The new first concrete corruption point is earlier and more actionable:
+The next live frontier is now the low-memory delayed-event queue/timer wake
+path, not a plain missing `JCB+$78` producer:
 
-- live loaded-RAM scheduler code at `$001C44` is:
-  - `LEA.L $78(A0),A3`
-  - `MOVE.L (A3),$041C.W`
-  - `CLR.L (A3)+`
-- just before that site on the clean native `cpu_model=68020` path:
-  - `JOBCUR=$0000A86E`
-  - `SYSTEM=$0030A404`
-  - `DRVVEC=$0000632C`
-- but `JCB+$78` at `$A8E6` is still zero, so the scheduler loads zero into
-  `$041C` and drops the job chain
-- `JCB+$78` never becomes nonzero in the traced run
-- the only observed writes to `$A8E6-$A8E9` are zero writes from:
-  - `PC=$032870`
-  - `PC=$033186`
-  - `PC=$00F05E`
-  - `PC=$001C4E`
-
-Related queue-link code nearby is now identified:
-
-- `$001D80: MOVE.L $041C.W,$78(A0)`
-- `$001D86: MOVE.L A0,$041C.W`
-- queue-link logic continues through `$001D8C..$001DB4`
+- the first scheduler dequeue at `$001C44/$001C48/$001C4C` still clears:
+  - `JOBCUR=$0000A86E -> 0`
+  - `JCB+$78=$00000000`
+- but the run also has a valid queued work block:
+  - `$001A2A` writes `($042A).L = $00007BC2`
+  - `$001980` sets `($046E).W = $00FF`
+- the live queued block at `$7BC2` is a timeout/work area seeded by the
+  loaded monitor path at `$00A2F0`, not the older `$1B00` callback node:
+  - `link=$00000000`
+  - `delay=$0000C350`
+  - `callback=$00000000`
+  - `owner=$00000000`
+- by `8,000,000` instructions, the delay never changes from `$0000C350`
+- none of the known timeout-service PCs are reached in that window:
+  - `$001902`, `$001910`, `$001920`, `$001924`, `$00227C`, `$002280`
+- none of the old queue-consumer/callback sites are reached either:
+  - `$00199C`, `$001B00`, `$001D10`, `$001D80`, `$001D86`
+- after the first dequeue, native code sits in the idle/wait loop around
+  `$001C90/$001CAC` with:
+  - `QHEAD=$00007BC2`
+  - `EVBUSY=$00FF`
+  - `WAKE0=$0000`
+  - no new interrupt taken during the open interrupt window at `$001C94`
 
 The ACIA theory is therefore demoted from “current blocker” to “negative
 finding”:
@@ -153,13 +155,13 @@ finding”:
 - simply injecting the existing compat serial-driver stub does not move the
   run past the earlier frontier
 
-So the next real problem is now producer-side scheduler linkage after the
-first successful low-memory alias `READ(10)` and the corrected exception
-return helpers:
+So the next real problem is now the periodic wake source behind the delayed
+event queue after the first successful low-memory alias `READ(10)` and the
+corrected exception return helpers:
 
-- who is supposed to populate `JOBCUR+$78`
-- why no native producer links a successor job before the scheduler reaches
-  `$001C48/$001C4C`
+- what is supposed to service or decrement the queued block at `$7BC2`
+- why the timeout-service path never runs before the later low-memory
+  corruption around `pc=$002584`
 
 ## THE BLOCKER — Native FIND ($A06C)
 
