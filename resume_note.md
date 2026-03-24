@@ -1,7 +1,52 @@
 # Resume Note
 
-Last updated: 2026-03-23
+Last updated: 2026-03-24
 Branch: `feature/native-boot-milestones`
+
+## Latest Checkpoint
+
+The apparent native `LED $12` ACIA/idle frontier was an emulator bug, not the
+real next monitor dependency.
+
+The low-memory `$FFFFC8/$FFFFC9` SCSI alias path now has one more confirmed
+hardware fix:
+
+- DMA completion from `alphasim/devices/scsi_bus.py` must raise an
+  autovectored **level-2** interrupt, not level 5
+- the device now reports `get_interrupt_level() == 2` when the DMA IRQ is
+  pending
+- a new integration regression covers the native `68020` path through the
+  first low-memory `READ(10)` and asserts:
+  - `SCSI READ lba=2 count=1`
+  - `SCSI IRQ ack level=2 vector=26`
+  - no stale level-5 acknowledge
+
+This materially moves the frontier again:
+
+- with clean native `cpu_model=68020` boot and no monkeypatching, a
+  `5,500,000` instruction probe now reaches:
+  - `PC = $083A10`
+  - LED history `06 0B 00 0E 0F 00`
+  - `JOBCUR = $00000000`
+  - `DRVVEC = $0000632C`
+- the old `LED $12` idle/scheduler loop at `$001C74/$001C90` no longer
+  appears in that window
+- the relevant SCSI trace at the new cutoff is:
+  - `SCSI DMA complete status=$00 irq_delay=2048`
+  - `SCSI IRQ pending`
+  - `SCSI IRQ ack level=2 vector=26`
+
+Negative findings that still hold on this newer path:
+
+- no ACIA transmit occurs by `8,000,000` instructions
+- ACIA port 0 still sees only one status read:
+  - `PC = $00F2B6`, read `$16`
+- there are still no writes to `$FFFE20-$FFFE25` or `$FFFE28`
+- `DRVVEC` still stays at the dummy stub `$632C`
+
+So the next real target is now later loaded-monitor work after the first
+successful low-memory `READ(10)` plus its corrected level-2 DMA interrupt,
+currently around `PC=$083A10`, not the superseded `LED $12` ACIA idle loop.
 
 ## Where We Left Off
 
@@ -233,6 +278,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/cpu/test_movec.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/devices/test_scsi_bus.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/devices/test_rtc_direct_bank.py tests/devices/test_rtc_msm5832.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration/test_boot_native_cpu_probe.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration/test_boot_native_scsi_dma_irq.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration/test_boot_native_scsi_alias_command.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration/test_boot_native_clock_bank.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/integration -k 'not test_native_boot_reads_amosl_ini_before_terminal_output'

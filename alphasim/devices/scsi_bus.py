@@ -189,12 +189,12 @@ class SCSIBusInterface(IODevice):
                     self._emit_trace("SCSI IRQ pending")
 
     def get_interrupt_level(self) -> int:
-        return 5 if self._irq_pending else 0
+        return 2 if self._irq_pending else 0
 
     def get_interrupt_vector(self) -> int:
-        # AM-1200 SCSI uses autovectored level-5 interrupt.
-        # Return 0 so the CPU uses the autovector (vector 29, address $074).
-        # The driver installs its ISR at $074 during the I/O handler setup.
+        # AM-1200 SCSI DMA completion uses autovectored level-2 interrupt.
+        # Return 0 so the CPU uses the autovector (vector 26, address $068).
+        # The loaded monitor/driver installs its ISR in that vector slot.
         return 0
 
     def acknowledge_interrupt(self, level: int) -> None:

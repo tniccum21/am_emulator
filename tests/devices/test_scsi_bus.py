@@ -39,3 +39,13 @@ def test_selection_requires_second_handshake_before_command_phase() -> None:
     assert scsi._phase == SCSIPhase.COMMAND
     assert scsi.read(0xFFFFC8, 1) == 0x16
     assert scsi._cdb_index == 0
+
+
+def test_pending_dma_irq_reports_level_two() -> None:
+    scsi = SCSIBusInterface()
+
+    assert scsi.get_interrupt_level() == 0
+
+    scsi._irq_pending = True
+
+    assert scsi.get_interrupt_level() == 2

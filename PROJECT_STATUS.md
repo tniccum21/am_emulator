@@ -1,6 +1,6 @@
 # AlphaSim AM-1200 Emulator — Project Status
 
-Last updated: 2026-03-23
+Last updated: 2026-03-24
 
 ## Overview
 
@@ -78,47 +78,48 @@ Three concrete upstream issues are now fixed:
    - after the second `00/00/01/11`, the interface enters real `COMMAND`
      phase and accepts CDB bytes
 
-That last fix moves native boot materially:
+That last fix moved native boot materially, but one more downstream hardware
+bug was still masking the next frontier:
 
-- on the `cpu_model=68020` path, the low-memory alias writer now emits a real
+- on the `cpu_model=68020` path, the low-memory alias writer emits a real
   `READ(10)` CDB:
   - `28 00 00 00 00 02 00 00 01 00`
 - the SCSI bus interface executes:
   - `READ lba=2 count=1`
-- longer runs now advance beyond the old alias-status stall and reach
-  `LED = 12`
+- after DMA, the AM-1200 monitor expects the SCSI completion interrupt on
+  autovectored **level 2**, not level 5
+- `alphasim/devices/scsi_bus.py` now raises level 2, and the native trace
+  shows:
+  - `SCSI DMA complete status=$00 irq_delay=2048`
+  - `SCSI IRQ pending`
+  - `SCSI IRQ ack level=2 vector=26`
 
-So the next real problem is downstream of the first successful low-memory
-alias `READ(10)`, not upstream in CPU selection or initial `$FFFFC8` setup.
+That correction removes the old apparent `LED = 12` frontier:
 
-That downstream frontier is now tighter too:
-
-- by LED `12`, the machine is no longer stuck in the earlier alias SCSI
-  command handshake
-- instead it is in the native idle/scheduler wait around
-  `$001C6C..$001CB6`
-- the PTM is not the active blocker on this `cpu_model=68020` path:
-  - the MC6840 still sits at power-on defaults
-  - no live PTM programming is observed in the measured LED `12` window
-- the active JCB at `$A86E` has a real disk/module context
-  (`JCB+$0C=$003E017C`, `JCB+$20=$00000A01`) but its successor link
-  stays zero (`JCB+$78=$00000000`)
-- `JOBCUR` is restored to `$A86E` at `$001D86`, but it is already zero at
-  `$001D80`, so the producer-side `MOVE.L ($041C).W,120(A0)` writes a null
-  successor and the scheduler falls back into the idle loop
-- the clean ACIA state at that idle loop is now measured:
+- with clean native `cpu_model=68020` boot and no runtime forcing,
+  a `5,500,000` instruction probe now reaches:
+  - `PC=$083A10`
+  - LED history `06 0B 00 0E 0F 00`
+  - `JOBCUR=$00000000`
   - `DRVVEC=$0000632C`
-  - ACIA port 0 control remains `CR=$00`
-  - the level-1 interrupt vector is live at `vector64=$00001358`
-  - injecting a byte with the clean `CR=$00` state sets `RDRF` but does not
-    wake the machine
-  - forcing `CR=$95` (RX IRQ enabled) and then injecting a byte immediately
-    breaks the system out of the idle loop and into live level-1 interrupt
-    work
+- the previous idle/scheduler loop at `$001C74/$001C90` with trailing
+  `LED = 12` no longer appears in that window
 
-So the next most useful target is the native console wake path after LED `12`:
-what exact ACIA configuration or IRQ behavior should move port 0 off `CR=$00`
-so the existing level-1 handler can resume native progress cleanly.
+The ACIA theory is therefore demoted from “current blocker” to “negative
+finding”:
+
+- by `8,000,000` instructions on the corrected path, there is still no ACIA
+  transmit
+- ACIA port 0 still sees only one observed access:
+  - status read at `PC=$00F2B6`, returning `$16`
+- there are still no writes to `$FFFE20-$FFFE25` or `$FFFE28`
+- simply injecting the existing compat serial-driver stub does not move the
+  run past the earlier frontier
+
+So the next real problem is now later loaded-monitor control flow after the
+first successful low-memory alias `READ(10)` and its corrected level-2 DMA
+interrupt, currently around `PC=$083A10`, not CPU selection, not the initial
+alias handshake, and not the superseded `LED 12` ACIA idle loop.
 
 ## THE BLOCKER — Native FIND ($A06C)
 
