@@ -53,13 +53,13 @@ def execute_exception(cpu: MC68010, vector_number: int,
     if cpu.use_68000_frames:
         # 68000-style 6-byte frame: just SR + PC, no format/vector word.
         #
-        # The native AM-1200 SCSI DMA completion path (vector 26) uses a
-        # monitor helper that pushes a replacement SR word and then executes
-        # RTE. That helper expects the stacked PC to sit immediately below
-        # the software-pushed SR word, so vector 26 needs the synthetic frame
-        # laid out as [PC][SR] in memory. Other compatibility-driven AM-1200
-        # handlers still expect the older [SR][PC] layout.
-        if vector_number == 26:
+        # Some native AM-1200 monitor helpers push a replacement SR word and
+        # then execute RTE. Those helpers expect the stacked PC to sit
+        # immediately below the software-pushed SR word, so vectors 8/9/26
+        # need the synthetic frame laid out as [PC][SR] in memory. Other
+        # compatibility-driven handlers still expect the older [SR][PC]
+        # layout.
+        if vector_number in {8, 9, 26}:
             cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
             cpu.bus.write_word(cpu.a[7], old_sr)
             cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF

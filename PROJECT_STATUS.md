@@ -53,8 +53,9 @@ With all bypasses active, running `printf 'VER\n' | python3 -m alphasim.main ...
 
 ## Current Native Frontier
 
-The current blocker is no longer the old pre-selector low-memory loop.
-Three concrete upstream issues are now fixed:
+The current blocker is no longer the old pre-selector low-memory loop, the
+ACIA hypothesis, or the earlier post-SCSI fill-region jumps. Several upstream
+issues are now fixed:
 
 1. **Missing `$FFFE40-$FFFE5F` direct clock/date bank**
    - implemented in `alphasim/devices/rtc_direct_bank.py`
@@ -94,30 +95,52 @@ bug was still masking the next frontier:
   - `SCSI IRQ pending`
   - `SCSI IRQ ack level=2 vector=26`
 
-That correction removed the old apparent `LED = 12` frontier, but one more
-downstream native bug was still distorting the control flow:
+That correction removed the old apparent `LED = 12` frontier, but two more
+downstream native bugs were still distorting the control flow:
 
 - the low-memory vector-26 helper at `$004EF8/$004EFC` pushes a replacement
   SR byte and then executes `RTE`
 - the emulator's generic synthetic 68000-style exception frame for normal
   exceptions left that helper returning into garbage instead of back to
   monitor code
-- `alphasim/cpu/exceptions.py` now applies a narrow compatibility rule only
-  for vector 26 so the helper returns correctly:
+- `alphasim/cpu/exceptions.py` now applies a narrow compatibility rule for
+  vectors 8, 9, and 26 so the relevant monitor helpers return correctly
+- privileged instructions in `alphasim/cpu/instructions.py` now raise vector 8
+  using the faulting opcode PC instead of the already-advanced PC
+- dedicated integration regressions now cover both return paths:
   - `PC=$001C98`
   - `SR=$0019`
-- a dedicated integration regression covers that exact return path
+- and later:
+  - `PC=$001CAC`
+  - `SR=$0019`
 
-That moves the native frontier materially again:
+Those corrections remove the earlier bogus jumps to fill regions around
+`PC=$190000`, `PC=$083A10`, and `PC=$1784B6`.
 
-- with clean native `cpu_model=68020` boot and no runtime forcing,
-  an `8,000,000` instruction probe now reaches:
-  - `PC=$1784B6`
-  - LED history `06 0B 00 0E 0F 00`
-  - `JOBCUR=$00000000`
+The new first concrete corruption point is earlier and more actionable:
+
+- live loaded-RAM scheduler code at `$001C44` is:
+  - `LEA.L $78(A0),A3`
+  - `MOVE.L (A3),$041C.W`
+  - `CLR.L (A3)+`
+- just before that site on the clean native `cpu_model=68020` path:
+  - `JOBCUR=$0000A86E`
+  - `SYSTEM=$0030A404`
   - `DRVVEC=$0000632C`
-- the machine no longer falls into the earlier bogus fill-pattern region
-  around `PC=$083A10`
+- but `JCB+$78` at `$A8E6` is still zero, so the scheduler loads zero into
+  `$041C` and drops the job chain
+- `JCB+$78` never becomes nonzero in the traced run
+- the only observed writes to `$A8E6-$A8E9` are zero writes from:
+  - `PC=$032870`
+  - `PC=$033186`
+  - `PC=$00F05E`
+  - `PC=$001C4E`
+
+Related queue-link code nearby is now identified:
+
+- `$001D80: MOVE.L $041C.W,$78(A0)`
+- `$001D86: MOVE.L A0,$041C.W`
+- queue-link logic continues through `$001D8C..$001DB4`
 
 The ACIA theory is therefore demoted from “current blocker” to “negative
 finding”:
@@ -130,11 +153,13 @@ finding”:
 - simply injecting the existing compat serial-driver stub does not move the
   run past the earlier frontier
 
-So the next real problem is now later loaded-monitor control flow after the
-first successful low-memory alias `READ(10)` and its corrected vector-26
-return helper, currently around the later fill-pattern frontier at
-`PC=$1784B6`, not CPU selection, not the initial alias handshake, and not the
-superseded `LED 12` ACIA idle loop.
+So the next real problem is now producer-side scheduler linkage after the
+first successful low-memory alias `READ(10)` and the corrected exception
+return helpers:
+
+- who is supposed to populate `JOBCUR+$78`
+- why no native producer links a successor job before the scheduler reaches
+  `$001C48/$001C4C`
 
 ## THE BLOCKER — Native FIND ($A06C)
 

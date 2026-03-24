@@ -1341,7 +1341,7 @@ def op_trap(cpu: MC68010, opword: int) -> int:
 def op_rte(cpu: MC68010, opword: int) -> int:
     """RTE — return from exception."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)  # privilege violation
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     return execute_rte(cpu)
 
@@ -1349,7 +1349,7 @@ def op_rte(cpu: MC68010, opword: int) -> int:
 def op_stop(cpu: MC68010, opword: int) -> int:
     """STOP #imm — load SR and stop."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(imm)
@@ -1365,7 +1365,7 @@ def op_nop(cpu: MC68010, opword: int) -> int:
 def op_reset_instr(cpu: MC68010, opword: int) -> int:
     """RESET instruction — assert reset line (supervisor only)."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     # Just a no-op in emulation — real hardware resets peripherals
     return 132
@@ -1378,7 +1378,7 @@ def op_reset_instr(cpu: MC68010, opword: int) -> int:
 def op_move_to_sr(cpu: MC68010, opword: int) -> int:
     """MOVE <ea>,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ea_mode = (opword >> 3) & 0x7
     ea_reg = opword & 0x7
@@ -1391,7 +1391,7 @@ def op_move_to_sr(cpu: MC68010, opword: int) -> int:
 def op_move_from_sr(cpu: MC68010, opword: int) -> int:
     """MOVE SR,<ea> — privileged on 68010."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ea_mode = (opword >> 3) & 0x7
     ea_reg = opword & 0x7
@@ -1413,7 +1413,7 @@ def op_move_to_ccr(cpu: MC68010, opword: int) -> int:
 def op_andi_sr(cpu: MC68010, opword: int) -> int:
     """ANDI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr & imm)
@@ -1423,7 +1423,7 @@ def op_andi_sr(cpu: MC68010, opword: int) -> int:
 def op_ori_sr(cpu: MC68010, opword: int) -> int:
     """ORI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr | imm)
@@ -1433,7 +1433,7 @@ def op_ori_sr(cpu: MC68010, opword: int) -> int:
 def op_eori_sr(cpu: MC68010, opword: int) -> int:
     """EORI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr ^ imm)
@@ -1615,7 +1615,7 @@ def op_exg(cpu: MC68010, opword: int) -> int:
 def op_move_usp(cpu: MC68010, opword: int) -> int:
     """MOVE USP,An or MOVE An,USP — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     reg = opword & 0x7
     direction = (opword >> 3) & 0x1
@@ -1635,7 +1635,7 @@ def op_move_usp(cpu: MC68010, opword: int) -> int:
 def op_movec(cpu: MC68010, opword: int) -> int:
     """MOVEC — move control register (68010+)."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ext = cpu.fetch_word()
     reg_num = (ext >> 12) & 0xF

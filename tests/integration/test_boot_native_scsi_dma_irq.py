@@ -82,3 +82,39 @@ def test_native_68020_scsi_irq_helper_rte_returns_to_monitor_code():
     bus.tick(0)
     assert (cpu.pc & 0xFFFFFF) == 0x001C98, f"pc=${cpu.pc & 0xFFFFFF:06X}"
     assert cpu.sr == 0x0019, f"sr=${cpu.sr:04X}"
+
+
+@pytest.mark.skipif(
+    not require_native_boot_assets() or not SELECTOR_IMAGE.exists(),
+    reason="ROM files or selector-trace disk image not present",
+)
+def test_native_68020_privilege_helper_rte_returns_to_faulting_move_to_sr():
+    cpu, bus, led, _acia, _sasi = build_native_boot_system(
+        SELECTOR_IMAGE,
+        cpu_model="68020",
+    )
+    helper_hits = 0
+    cpu.reset()
+
+    while helper_hits < 2:
+        if (cpu.pc & 0xFFFFFF) == 0x004EF8:
+            helper_hits += 1
+            if helper_hits == 2:
+                break
+        cycles = cpu.step()
+        bus.tick(cycles)
+
+    assert helper_hits == 2, (
+        "Native 68020 boot did not reach the second low-memory RTE helper hit "
+        f"before the search window ended. pc=${cpu.pc & 0xFFFFFF:06X} "
+        f"leds={[f'{value:02X}' for value in led.history]}"
+    )
+
+    cpu.step()
+    bus.tick(0)
+    assert (cpu.pc & 0xFFFFFF) == 0x004EFC, f"pc=${cpu.pc & 0xFFFFFF:06X}"
+
+    cpu.step()
+    bus.tick(0)
+    assert (cpu.pc & 0xFFFFFF) == 0x001CAC, f"pc=${cpu.pc & 0xFFFFFF:06X}"
+    assert cpu.sr == 0x0019, f"sr=${cpu.sr:04X}"

@@ -5,68 +5,81 @@ Branch: `feature/native-boot-milestones`
 
 ## Latest Checkpoint
 
-The next real native bug after the SCSI DMA level fix was the low-memory
-vector-26 return path, not ACIA.
+The next real native bug after the SCSI DMA level fix was not SCSI anymore;
+it was later privilege/trace exception return flow in loaded RAM.
 
-The low-memory `$FFFFC8/$FFFFC9` SCSI alias path now has one more confirmed
-hardware fix:
+Two closely related emulator fixes are now in place:
 
-- DMA completion from `alphasim/devices/scsi_bus.py` must raise an
-  autovectored **level-2** interrupt, not level 5
-- the device now reports `get_interrupt_level() == 2` when the DMA IRQ is
-  pending
-- a new integration regression covers the native `68020` path through the
-  first low-memory `READ(10)` and asserts:
-  - `SCSI READ lba=2 count=1`
-  - `SCSI IRQ ack level=2 vector=26`
-  - no stale level-5 acknowledge
-- a second integration regression now covers the follow-on helper at
-  `$004EF8/$004EFC` and asserts that its `RTE` returns to live monitor code:
-  - `PC = $001C98`
+- privilege-violation handlers in `alphasim/cpu/instructions.py` now pass the
+  faulting opcode PC via `pc_override=(cpu.pc - 2) & 0xFFFFFF`
+- the synthetic 68000-style exception-frame compatibility rule in
+  `alphasim/cpu/exceptions.py` now uses the alternate `[PC][SR]` layout for
+  vectors **8**, **9**, and **26**
+
+Why this was necessary:
+
+- after the first corrected vector-26 return, native code reaches
+  `$001CAC: MOVE.W #$2700,SR`
+- because the helper restored `SR=$0019`, that instruction must fault with
+  privilege violation vector 8
+- the old emulator path stacked the already-advanced PC, so vector 8 saw
+  `$001CAE` (the immediate word `2700`) instead of the faulting opcode at
+  `$001CAC`
+- the later helper at `$004EF8/$004EFC` also expects the same alternate
+  compatibility frame order already proven for vector 26
+
+The new regression coverage is:
+
+- native low-memory DMA IRQ still acknowledges as vector 26 and returns to
+  `PC=$001C98`, `SR=$0019`
+- a second regression now proves the later helper returns to the faulting
+  `MOVE.W #$2700,SR` at:
+  - `PC = $001CAC`
   - `SR = $0019`
 
-The concrete bug was in the emulator's synthetic 68000-style exception frame
-layout for the **vector-26** SCSI DMA completion interrupt:
+This removes the earlier bogus fill-region frontier:
 
-- the monitor helper pushes a replacement SR word and then executes `RTE`
-- with the old generic `[SR][PC]` synthetic frame, that helper returned into
-  garbage and the machine later fell into an earlier bogus fill region around
-  `$083A10`
-- a narrow compatibility fix in `alphasim/cpu/exceptions.py` now gives only
-  vector 26 the alternate synthetic layout that helper expects
-- broader attempts to change all exceptions or all interrupts were tested and
-  rejected because they broke earlier native exception-driven flow before the
-  first SCSI DMA IRQ
+- the old bad jumps to `PC=$190000`, `PC=$083A10`, and later `PC=$1784B6`
+  are no longer the first blockers on the clean native `cpu_model=68020` path
+- an `8,000,000` instruction probe now instead ends in a later corrupted
+  state around:
+  - `PC = $002584`
+  - `SR = $2008`
+  - `JOBCUR = $FFFFFE60`
+  - `DRVVEC = $00190019`
+  - `SYSTEM = $0000FFFF`
 
-This materially moves the frontier again:
+But that end state is no longer the highest-value frontier. The first concrete
+corruption is now much earlier in the scheduler:
 
-- with clean native `cpu_model=68020` boot and no runtime monkeypatching, an
-  `8,000,000` instruction probe now reaches:
-  - `PC = $1784B6`
-  - LED history `06 0B 00 0E 0F 00`
-  - `JOBCUR = $00000000`
+- live code at `$001C44` is:
+  - `LEA.L $78(A0),A3`
+  - `MOVE.L (A3),$041C.W`
+  - `CLR.L (A3)+`
+- at `PC=$001C48/$001C4C`, the active JCB is still sane:
+  - `JOBCUR = $0000A86E`
+  - `SYSTEM = $0030A404`
   - `DRVVEC = $0000632C`
-- the machine no longer falls into the earlier bogus fill region at
-  `$083A10`; the same kind of fill-pattern execution now first appears much
-  later around `$1784B6`
-- the relevant SCSI trace at the new cutoff is:
-  - `SCSI DMA complete status=$00 irq_delay=2048`
-  - `SCSI IRQ pending`
-  - `SCSI IRQ ack level=2 vector=26`
-  - helper return path reaches `PC = $001C98`
+- but `JCB+$78` at `$A8E6` is still zero, so the scheduler loads zero into
+  `$041C` and clears the current job chain
 
-Negative findings that still hold on this newer path:
+Direct evidence for the new blocker:
 
-- no ACIA transmit occurs by `8,000,000` instructions
-- ACIA port 0 still sees only one status read:
-  - `PC = $00F2B6`, read `$16`
-- there are still no writes to `$FFFE20-$FFFE25` or `$FFFE28`
-- `DRVVEC` still stays at the dummy stub `$632C`
+- `JCB+$78` never becomes nonzero on the traced native path
+- the only observed writes to `$A8E6-$A8E9` are zero writes from:
+  - `PC = $032870`
+  - `PC = $033186`
+  - `PC = $00F05E`
+  - `PC = $001C4E`
+- related scheduler/link code also exists at:
+  - `$001D80: MOVE.L $041C.W,$78(A0)`
+  - `$001D86: MOVE.L A0,$041C.W`
 
-So the next real target is now later loaded-monitor work after the first
-successful low-memory `READ(10)` plus its corrected vector-26 return helper,
-currently around the later fill-pattern frontier `PC=$1784B6`, not the
-superseded `LED $12` ACIA idle loop or the earlier bogus `$083A10` frontier.
+So the next real target is no longer exception-frame recovery. It is now:
+
+- who is supposed to link the successor job into `JOBCUR+$78`
+- why no producer ever makes `JCB+$78` at `$A8E6` nonzero before the scheduler
+  reaches `$001C48/$001C4C`
 
 ## Where We Left Off
 
