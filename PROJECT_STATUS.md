@@ -94,16 +94,30 @@ bug was still masking the next frontier:
   - `SCSI IRQ pending`
   - `SCSI IRQ ack level=2 vector=26`
 
-That correction removes the old apparent `LED = 12` frontier:
+That correction removed the old apparent `LED = 12` frontier, but one more
+downstream native bug was still distorting the control flow:
+
+- the low-memory vector-26 helper at `$004EF8/$004EFC` pushes a replacement
+  SR byte and then executes `RTE`
+- the emulator's generic synthetic 68000-style exception frame for normal
+  exceptions left that helper returning into garbage instead of back to
+  monitor code
+- `alphasim/cpu/exceptions.py` now applies a narrow compatibility rule only
+  for vector 26 so the helper returns correctly:
+  - `PC=$001C98`
+  - `SR=$0019`
+- a dedicated integration regression covers that exact return path
+
+That moves the native frontier materially again:
 
 - with clean native `cpu_model=68020` boot and no runtime forcing,
-  a `5,500,000` instruction probe now reaches:
-  - `PC=$083A10`
+  an `8,000,000` instruction probe now reaches:
+  - `PC=$1784B6`
   - LED history `06 0B 00 0E 0F 00`
   - `JOBCUR=$00000000`
   - `DRVVEC=$0000632C`
-- the previous idle/scheduler loop at `$001C74/$001C90` with trailing
-  `LED = 12` no longer appears in that window
+- the machine no longer falls into the earlier bogus fill-pattern region
+  around `PC=$083A10`
 
 The ACIA theory is therefore demoted from “current blocker” to “negative
 finding”:
@@ -117,9 +131,10 @@ finding”:
   run past the earlier frontier
 
 So the next real problem is now later loaded-monitor control flow after the
-first successful low-memory alias `READ(10)` and its corrected level-2 DMA
-interrupt, currently around `PC=$083A10`, not CPU selection, not the initial
-alias handshake, and not the superseded `LED 12` ACIA idle loop.
+first successful low-memory alias `READ(10)` and its corrected vector-26
+return helper, currently around the later fill-pattern frontier at
+`PC=$1784B6`, not CPU selection, not the initial alias handshake, and not the
+superseded `LED 12` ACIA idle loop.
 
 ## THE BLOCKER — Native FIND ($A06C)
 

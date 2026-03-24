@@ -48,3 +48,37 @@ def test_native_68020_boot_acknowledges_scsi_dma_irq_on_level_two():
     )
     assert any("SCSI READ lba=2 count=1" in entry for entry in trace), trace
     assert not any("level=5" in entry for entry in trace), trace
+
+
+@pytest.mark.skipif(
+    not require_native_boot_assets() or not SELECTOR_IMAGE.exists(),
+    reason="ROM files or selector-trace disk image not present",
+)
+def test_native_68020_scsi_irq_helper_rte_returns_to_monitor_code():
+    cpu, bus, led, _acia, _sasi = build_native_boot_system(
+        SELECTOR_IMAGE,
+        cpu_model="68020",
+    )
+    cpu.reset()
+
+    result = run_native_boot(
+        cpu,
+        bus,
+        led,
+        stop=lambda: (cpu.pc & 0xFFFFFF) == 0x004EF8,
+        max_instructions=4_200_000,
+    )
+
+    assert result.completed, (
+        "Native 68020 boot did not reach the low-memory SCSI IRQ return helper "
+        f"at $004EF8. pc=${result.pc:06X} leds={[f'{value:02X}' for value in result.led_history]}"
+    )
+
+    cpu.step()
+    bus.tick(0)
+    assert (cpu.pc & 0xFFFFFF) == 0x004EFC, f"pc=${cpu.pc & 0xFFFFFF:06X}"
+
+    cpu.step()
+    bus.tick(0)
+    assert (cpu.pc & 0xFFFFFF) == 0x001C98, f"pc=${cpu.pc & 0xFFFFFF:06X}"
+    assert cpu.sr == 0x0019, f"sr=${cpu.sr:04X}"

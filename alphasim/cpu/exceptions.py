@@ -51,14 +51,24 @@ def execute_exception(cpu: MC68010, vector_number: int,
     stacked_pc = pc_override if pc_override is not None else cpu.pc
 
     if cpu.use_68000_frames:
-        # 68000-style 6-byte frame: just SR + PC, no format/vector word
-        #   Push PC (longword)
-        cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
-        cpu.bus.write_long(cpu.a[7], stacked_pc & 0xFFFFFFFF)
-
-        #   Push SR (word)
-        cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
-        cpu.bus.write_word(cpu.a[7], old_sr)
+        # 68000-style 6-byte frame: just SR + PC, no format/vector word.
+        #
+        # The native AM-1200 SCSI DMA completion path (vector 26) uses a
+        # monitor helper that pushes a replacement SR word and then executes
+        # RTE. That helper expects the stacked PC to sit immediately below
+        # the software-pushed SR word, so vector 26 needs the synthetic frame
+        # laid out as [PC][SR] in memory. Other compatibility-driven AM-1200
+        # handlers still expect the older [SR][PC] layout.
+        if vector_number == 26:
+            cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
+            cpu.bus.write_word(cpu.a[7], old_sr)
+            cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
+            cpu.bus.write_long(cpu.a[7], stacked_pc & 0xFFFFFFFF)
+        else:
+            cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
+            cpu.bus.write_long(cpu.a[7], stacked_pc & 0xFFFFFFFF)
+            cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
+            cpu.bus.write_word(cpu.a[7], old_sr)
     else:
         # 68010 8-byte frame: SR + PC + format/vector word
         format_vector = (0 << 12) | ((vector_number & 0xFF) << 2)

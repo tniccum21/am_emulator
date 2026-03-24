@@ -5,8 +5,8 @@ Branch: `feature/native-boot-milestones`
 
 ## Latest Checkpoint
 
-The apparent native `LED $12` ACIA/idle frontier was an emulator bug, not the
-real next monitor dependency.
+The next real native bug after the SCSI DMA level fix was the low-memory
+vector-26 return path, not ACIA.
 
 The low-memory `$FFFFC8/$FFFFC9` SCSI alias path now has one more confirmed
 hardware fix:
@@ -20,21 +20,40 @@ hardware fix:
   - `SCSI READ lba=2 count=1`
   - `SCSI IRQ ack level=2 vector=26`
   - no stale level-5 acknowledge
+- a second integration regression now covers the follow-on helper at
+  `$004EF8/$004EFC` and asserts that its `RTE` returns to live monitor code:
+  - `PC = $001C98`
+  - `SR = $0019`
+
+The concrete bug was in the emulator's synthetic 68000-style exception frame
+layout for the **vector-26** SCSI DMA completion interrupt:
+
+- the monitor helper pushes a replacement SR word and then executes `RTE`
+- with the old generic `[SR][PC]` synthetic frame, that helper returned into
+  garbage and the machine later fell into an earlier bogus fill region around
+  `$083A10`
+- a narrow compatibility fix in `alphasim/cpu/exceptions.py` now gives only
+  vector 26 the alternate synthetic layout that helper expects
+- broader attempts to change all exceptions or all interrupts were tested and
+  rejected because they broke earlier native exception-driven flow before the
+  first SCSI DMA IRQ
 
 This materially moves the frontier again:
 
-- with clean native `cpu_model=68020` boot and no monkeypatching, a
-  `5,500,000` instruction probe now reaches:
-  - `PC = $083A10`
+- with clean native `cpu_model=68020` boot and no runtime monkeypatching, an
+  `8,000,000` instruction probe now reaches:
+  - `PC = $1784B6`
   - LED history `06 0B 00 0E 0F 00`
   - `JOBCUR = $00000000`
   - `DRVVEC = $0000632C`
-- the old `LED $12` idle/scheduler loop at `$001C74/$001C90` no longer
-  appears in that window
+- the machine no longer falls into the earlier bogus fill region at
+  `$083A10`; the same kind of fill-pattern execution now first appears much
+  later around `$1784B6`
 - the relevant SCSI trace at the new cutoff is:
   - `SCSI DMA complete status=$00 irq_delay=2048`
   - `SCSI IRQ pending`
   - `SCSI IRQ ack level=2 vector=26`
+  - helper return path reaches `PC = $001C98`
 
 Negative findings that still hold on this newer path:
 
@@ -45,8 +64,9 @@ Negative findings that still hold on this newer path:
 - `DRVVEC` still stays at the dummy stub `$632C`
 
 So the next real target is now later loaded-monitor work after the first
-successful low-memory `READ(10)` plus its corrected level-2 DMA interrupt,
-currently around `PC=$083A10`, not the superseded `LED $12` ACIA idle loop.
+successful low-memory `READ(10)` plus its corrected vector-26 return helper,
+currently around the later fill-pattern frontier `PC=$1784B6`, not the
+superseded `LED $12` ACIA idle loop or the earlier bogus `$083A10` frontier.
 
 ## Where We Left Off
 
