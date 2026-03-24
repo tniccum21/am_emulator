@@ -26,6 +26,7 @@ class SystemConfig:
     # compat: legacy path with Python-side boot assistance still enabled
     boot_mode: str = "native"
     boot_monitor_override: str | None = None
+    cpu_model: str = "68010"
 
     # Debug options
     trace_enabled: bool = False

@@ -23,6 +23,7 @@ from .devices.sasi import SASIController
 from .devices.acia6850 import ACIA6850
 from .devices.primary_serial_setup import PrimarySerialSetup
 from .devices.timer6840 import Timer6840
+from .devices.rtc_direct_bank import RTCDirectBank
 from .devices.rtc_msm5832 import RTC_MSM5832
 from .devices.scsi_bus import SCSIBusInterface
 from .storage.disk_image import DiskImage
@@ -58,6 +59,10 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     rtc = RTC_MSM5832()
     bus.register_device(0xFFFE04, 0xFFFE05, rtc)
 
+    # Native AMOSL.MON also probes a direct-mapped clock/date bank here.
+    rtc_direct = RTCDirectBank()
+    bus.register_device(0xFFFE40, 0xFFFE5F, rtc_direct)
+
     # MC6840 PTM timer at $FFFE10-$FFFE1F (odd byte addresses)
     timer = Timer6840()
     bus.register_device(0xFFFE10, 0xFFFE1F, timer)
@@ -87,7 +92,7 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
         scsi_bus.target = target  # Same disk for OS driver
 
     # CPU
-    cpu = MC68010(bus)
+    cpu = MC68010(bus, cpu_model=config.cpu_model)
     cpu.opcode_table = build_opcode_table()
 
     # Wire DMA references for SCSI bus interface
@@ -1947,6 +1952,12 @@ def main() -> None:
         help="Maximum instructions to execute (0=unlimited)"
     )
     parser.add_argument(
+        "--cpu-model",
+        choices=["68010", "68020", "68030", "68040"],
+        default="68010",
+        help="Expose the requested CPU model to MOVEC-based monitor probes",
+    )
+    parser.add_argument(
         "--break", dest="breakpoints", type=str, nargs="*", default=[],
         help="Breakpoint addresses (hex, e.g. 800018)"
     )
@@ -1967,6 +1978,7 @@ def main() -> None:
         disk_image_path=args.disk,
         boot_monitor_override=args.boot_monitor,
         boot_mode=args.boot_mode,
+        cpu_model=args.cpu_model,
         trace_enabled=args.trace,
         trace_file=args.trace_file,
         native_find_trace=args.trace_native_find,

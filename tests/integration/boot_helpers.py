@@ -103,6 +103,7 @@ class BootRunResult:
 def build_native_boot_system(
     disk_image_path: Path | None = None,
     config_dip: int = 0x0A,
+    cpu_model: str = "68010",
 ):
     config = SystemConfig(
         rom_even_path=ROM_EVEN,
@@ -110,6 +111,7 @@ def build_native_boot_system(
         ram_size=0x400000,
         config_dip=config_dip,
         disk_image_path=disk_image_path,
+        cpu_model=cpu_model,
     )
     cpu, bus, led, acia = build_system(config)
     sasi = next(

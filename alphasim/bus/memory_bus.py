@@ -48,6 +48,7 @@ class MemoryBus:
         $800000–$803FFF  Boot ROM (16KB)
         $FFFE00          LED (write-only, abs short $FE00)
         $FFFE03          Config DIP (read-only, abs short $FE03)
+        $FFFE40–$FFFE5F  Direct clock/date bank
         $FFFFE0–$FFFFE7  SASI controller
         ...              other I/O via registered ranges
     """

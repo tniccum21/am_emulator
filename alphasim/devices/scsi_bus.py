@@ -91,6 +91,7 @@ class SCSIBusInterface(IODevice):
         self._bsy = False       # Bus busy
         self._req = False       # Target requesting transfer
         self._selecting = False  # Selection in progress
+        self._selection_response_pending = False
 
         # Command Descriptor Block buffer
         self._cdb: bytearray = bytearray(12)
@@ -230,6 +231,8 @@ class SCSIBusInterface(IODevice):
         compares the masked status against exact phase values ($16, $1E).
         """
         if self._phase == SCSIPhase.BUS_FREE:
+            if self._selection_response_pending:
+                return 0x14
             return 0x00
 
         # Map internal phase to hardware encoding
@@ -253,6 +256,22 @@ class SCSIBusInterface(IODevice):
     def _write_control(self, value: int) -> None:
         """Handle control register writes for bus selection/reset."""
         self._trace(f"CTRL write ${value:02X} (phase={self._phase.name}, sel_step={self._sel_step})")
+
+        if self._selection_response_pending:
+            if value == 0x00:
+                self._sel_step = 1
+                self._trace("Selection response acknowledged")
+                return
+
+            if self._sel_step == 1 and value == 0x01:
+                self._sel_step = 2
+                self._trace("Selection retry: BSY asserted")
+                return
+
+            if self._sel_step == 2 and (value == 0x11 or value == 0x01):
+                self._selection_response_pending = False
+                self._enter_command_phase()
+                return
 
         if value == 0x00:
             # Negate all bus lines — start of selection or bus release
@@ -297,7 +316,13 @@ class SCSIBusInterface(IODevice):
             pass
 
     def _complete_selection(self) -> None:
-        """Target responds to selection — enter COMMAND phase."""
+        """Target responds to selection.
+
+        The low-memory monitor path expects an intermediate status value
+        ($14) after the first 00/00/01/11 handshake, then repeats the same
+        handshake before the device enters real COMMAND phase and accepts
+        CDB bytes.
+        """
         if self.target is None:
             # No target — stay bus free (selection timeout)
             self._phase = SCSIPhase.BUS_FREE
@@ -308,6 +333,17 @@ class SCSIBusInterface(IODevice):
             self._emit_trace("SCSI selection failed")
             return
 
+        self._selection_response_pending = True
+        self._phase = SCSIPhase.BUS_FREE
+        self._bsy = False
+        self._req = False
+        self._selecting = False
+        self._sel_step = 0
+        self._trace("Selection acknowledged -> pending command handshake")
+        self._emit_trace("SCSI selection acknowledged -> pending command")
+
+    def _enter_command_phase(self) -> None:
+        """Enter COMMAND phase after the monitor's second selection handshake."""
         self._phase = SCSIPhase.COMMAND
         self._bsy = True
         self._req = True  # Target asserts REQ — ready for CDB bytes
@@ -400,6 +436,10 @@ class SCSIBusInterface(IODevice):
             return
 
         # During selection, data writes set target ID
+        if self._selection_response_pending:
+            self._trace(f"Selection-response data ignore: ${value:02X}")
+            return
+
         if self._sel_step >= 1:
             self._trace(f"Selection data: ${value:02X}")
 

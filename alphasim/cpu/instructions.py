@@ -1650,18 +1650,16 @@ def op_movec(cpu: MC68010, opword: int) -> int:
         is_addr = True
         rn = reg_num - 8
 
+    if not cpu.supports_control_register(cr):
+        # Unsupported control registers (for example CACR on a 68010) must
+        # trap as illegal instructions so ROM CPU-detection probes can follow
+        # their exception-driven fallback path.
+        execute_exception(cpu, 4)
+        return 34
+
     if direction == 0:
         # Control register → general register
-        if cr == 0x800:  # USP
-            val = cpu.usp
-        elif cr == 0x801:  # VBR
-            val = cpu.vbr
-        elif cr == 0x000:  # SFC
-            val = 0
-        elif cr == 0x001:  # DFC
-            val = 0
-        else:
-            val = 0
+        val = cpu.read_control_register(cr)
         if is_addr:
             cpu.a[rn] = val & 0xFFFFFFFF
         else:
@@ -1672,10 +1670,7 @@ def op_movec(cpu: MC68010, opword: int) -> int:
             val = cpu.a[rn]
         else:
             val = cpu.d[rn]
-        if cr == 0x800:  # USP
-            cpu.usp = val & 0xFFFFFFFF
-        elif cr == 0x801:  # VBR
-            cpu.vbr = val & 0xFFFFFFFF
+        cpu.write_control_register(cr, val)
 
     return 12
 
