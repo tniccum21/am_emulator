@@ -176,10 +176,52 @@ So the strongest current diagnosis is:
   classification path and arriving at `D1=2`
 - AM-1400-style higher CPU classification no longer needs a fake `SYSTEM`
   write; it can now be exercised natively by selecting `cpu_model=68020`
-- the next real task is to trace how far native boot progresses on the
-  `cpu_model=68020` path beyond the first successful low-memory `READ(10)`
-  and determine the next missing hardware or protocol edge after that alias
-  command stage
+- the first successful low-memory `READ(10)` is now followed by a different
+  native frontier than the old PTM-driven low-memory loop:
+  - by LED `$12`, the machine is in the idle/scheduler wait around
+    `$001C6C..$001CB6`
+  - the active JCB at `$A86E` has:
+    - `JCB+$0C = $003E017C`
+    - `JCB+$20 = $00000A01`
+    - `JCB+$78 = $00000000`
+    - `JCB+$7C = $0000B440`
+    - `JCB+$80 = $0000B0B8`
+  - `SYSTEM = $0030A404`
+  - `DEVTBL = $003E014E`
+  - `DDBCHN = $00007BA2`
+  - `ZSYDSK = $0000B440`
+  - `SYSBAS = $00000000`
+  - `JOBCUR = $00000000`
+  - `DRVVEC = $0000632C`
+- on this `68020` path, the PTM is *not* the current wake source:
+  - by LED `$12`, the MC6840 still sits at power-on defaults
+    (`CR1=$00 CR2=$01 CR3=$00`, all latches zero, no flags set)
+  - no live PTM access is observed in the measured window that reaches the
+    LED `$12` idle loop
+- the scheduler-side producer edge is now sharper:
+  - `$001D80`: `MOVE.L ($041C).W,120(A0)` writes the old `JOBCUR` into the
+    successor link
+  - `$001D86`: `MOVE.L A0,($041C).W` restores `JOBCUR = $A86E`
+  - but `JOBCUR` is already zero at `$001D80`, so `JCB+$78` is written as
+    zero and the scheduler later drops back into the idle loop
+- the ACIA side is now the strongest new hardware lead:
+  - clean native state at the LED `$12` idle loop:
+    - port 0 control register stays `$00`
+    - `DRVVEC` remains the dummy stub `$632C`
+    - the ACIA level-1 vector is live at `vector64 = $00001358`
+  - injecting a byte at the idle loop with the clean `CR=$00` state does
+    nothing useful:
+    - `RDRF` becomes set
+    - `JOBCUR` stays zero
+    - `PC` stays in the `$001C90` idle window
+  - forcing `CR=$95` (RX IRQ enabled) and then injecting a byte immediately
+    breaks the machine out of the idle loop and into live level-1 interrupt
+    work
+
+So the next real target is no longer the alias SCSI bus or the PTM. It is the
+native console wake path after LED `$12`: why port 0 remains at `CR=$00`, and
+what exact ACIA configuration/IRQ behavior is required for the existing
+level-1 handler at vector `$1358` to resume native progress cleanly.
 
 ## Useful Commands
 
@@ -234,6 +276,13 @@ for _ in range(4_200_000):
         break
 print(cpu.pc & 0xFFFFFF, [f"{x:02X}" for x in led.history], log[:20], log[-20:])
 PY
+```
+
+Current idle/ACIA frontier tracer:
+
+```bash
+python3 trace_native_idle_acia.py
+python3 trace_native_idle_acia.py --force-rx-irq
 ```
 
 Ad hoc frontier probe:

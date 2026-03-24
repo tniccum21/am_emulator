@@ -91,6 +91,35 @@ That last fix moves native boot materially:
 So the next real problem is downstream of the first successful low-memory
 alias `READ(10)`, not upstream in CPU selection or initial `$FFFFC8` setup.
 
+That downstream frontier is now tighter too:
+
+- by LED `12`, the machine is no longer stuck in the earlier alias SCSI
+  command handshake
+- instead it is in the native idle/scheduler wait around
+  `$001C6C..$001CB6`
+- the PTM is not the active blocker on this `cpu_model=68020` path:
+  - the MC6840 still sits at power-on defaults
+  - no live PTM programming is observed in the measured LED `12` window
+- the active JCB at `$A86E` has a real disk/module context
+  (`JCB+$0C=$003E017C`, `JCB+$20=$00000A01`) but its successor link
+  stays zero (`JCB+$78=$00000000`)
+- `JOBCUR` is restored to `$A86E` at `$001D86`, but it is already zero at
+  `$001D80`, so the producer-side `MOVE.L ($041C).W,120(A0)` writes a null
+  successor and the scheduler falls back into the idle loop
+- the clean ACIA state at that idle loop is now measured:
+  - `DRVVEC=$0000632C`
+  - ACIA port 0 control remains `CR=$00`
+  - the level-1 interrupt vector is live at `vector64=$00001358`
+  - injecting a byte with the clean `CR=$00` state sets `RDRF` but does not
+    wake the machine
+  - forcing `CR=$95` (RX IRQ enabled) and then injecting a byte immediately
+    breaks the system out of the idle loop and into live level-1 interrupt
+    work
+
+So the next most useful target is the native console wake path after LED `12`:
+what exact ACIA configuration or IRQ behavior should move port 0 off `CR=$00`
+so the existing level-1 handler can resume native progress cleanly.
+
 ## THE BLOCKER — Native FIND ($A06C)
 
 The OS has **never successfully found a file on disk by itself**.
