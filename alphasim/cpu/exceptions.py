@@ -53,13 +53,13 @@ def execute_exception(cpu: MC68010, vector_number: int,
     if cpu.use_68000_frames:
         # 68000-style 6-byte frame: just SR + PC, no format/vector word.
         #
-        # Some native AM-1200 monitor helpers push a replacement SR word and
-        # then execute RTE. Those helpers expect the stacked PC to sit
-        # immediately below the software-pushed SR word, so vectors 8/9/26
-        # need the synthetic frame laid out as [PC][SR] in memory. Other
-        # compatibility-driven handlers still expect the older [SR][PC]
-        # layout.
-        if vector_number in {8, 9, 26}:
+        # The native vector-26 SCSI DMA helper pushes a replacement SR word
+        # and then executes RTE. That helper expects the stacked PC to sit
+        # immediately below the software-pushed SR word, so vector 26 needs
+        # the synthetic frame laid out as [PC][SR] in memory. Other native
+        # handlers, including the privilege-violation path at $000AFC, expect
+        # the normal 68000 [SR][PC] short-frame layout.
+        if vector_number == 26:
             cpu.a[7] = (cpu.a[7] - 2) & 0xFFFFFFFF
             cpu.bus.write_word(cpu.a[7], old_sr)
             cpu.a[7] = (cpu.a[7] - 4) & 0xFFFFFFFF
@@ -206,8 +206,11 @@ def execute_rte(cpu: MC68010) -> int:
         # byte of the stacked SR before executing RTE. Those helpers expect the
         # restored state to retain supervisor mode while resuming the wait loop
         # at $001C98/$001CAC.
-        if ((((cpu.pc - 2) & 0xFFFFFF) == 0x004EFC) and
+        helper_pc = (cpu.pc - 2) & 0xFFFFFF
+        if ((helper_pc == 0x004EFC) and
                 (new_pc & 0xFFFFFF) in {0x001C98, 0x001CAC}):
+            new_sr |= SR_SUPER
+        elif helper_pc in {0x003DDA, 0x003DE2}:
             new_sr |= SR_SUPER
 
     if not cpu.use_68000_frames:

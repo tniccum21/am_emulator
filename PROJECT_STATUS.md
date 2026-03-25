@@ -53,6 +53,103 @@ With all bypasses active, running `printf 'VER\n' | python3 -m alphasim.main ...
 
 ## Current Native Frontier
 
+There are currently **two different native frontiers**, depending on which
+disk image is being exercised. They should not be conflated.
+
+### Selector/PIT Frontier (`HD0-V1.4C-Bootable-on-1400.img`)
+
+This is the image used by `tests/integration/test_boot_native_pit_irq.py`.
+On this path, the recent PIT work is still valid:
+
+- native `cpu_model=68020` boot reaches the PIT-backed level-6 handler at
+  `$0018E0`
+- the same path reaches later monitor code at `$001DBE`
+
+Those regressions are useful, but they do **not** prove progress on the real
+`AMOSL.INI` boot path.
+
+### Real Boot Frontier (`AMOS_1-3_Boot_OS.img`)
+
+This is the image that matters for `AMOSL.INI`, and it is still blocked
+earlier.
+
+What is now verified on the current tree:
+
+- `AMOSL.INI` still starts at logical block `3334`, so the first native read
+  would be `LBA 3335`
+- `trace_native_amosl_ini_path.py` on the real boot image still tops out at
+  `LBA 3326`
+- therefore native boot is still blocked in an **earlier command-file/job
+  path**, not at terminal bring-up and not yet at `AMOSL.INI`
+
+The current real-boot stop after a long native run is:
+
+- `pc=$001C72`
+- LED history `06 0B 00 0E 0F 00`
+- `JCB+$20=$000B`
+- `JCB+$38=$003E8000`
+- final low sysvars are invalid:
+  - `JOBCUR=$00FFFE11`
+  - `JOBQ=$00000000`
+  - `DDBCHN=$00007038`
+  - `ZSYDSK=$00006C3A`
+
+The most concrete upstream lead is now the earlier, still-stable sysvar/job
+regime captured by `trace_native_sysvar_corruption.py`:
+
+- initial real-boot setup:
+  - `ZSYDSK: $00000000 -> $00007030` at `pc=$033186`
+  - `JOBCUR: $00000000 -> $00007038` at `pc=$00819A`
+  - `ZSYDSK: $00007030 -> $00007AC2` at `pc=$0081B6`
+- then the repeating late loop before the `3326` ceiling:
+  - `pc=$001230`: `JOBCUR $7038 -> 0`
+  - `pc=$001338`: `JOBCUR 0 -> $7038`
+
+So the next real problem is the earlier command-file/job scheduler path,
+especially why the real boot image stays trapped in the `JOBCUR 0 <-> $7038`
+regime and later drifts into the final bogus sysvars
+instead of advancing to the first `AMOSL.INI` read.
+
+The current tree also refines the older March-10 scheduler hypothesis:
+
+- the natural real-boot path still reaches the same late scheduler sites with
+  `USP = 0`
+- first clean hits now confirm the loaded-monitor ops directly:
+  - `$00122C`: `MOVE.L (A3),($041C).W`
+  - `$001230`: `CLR.L (A3)+`
+  - `$001338`: `CLR.L 120(A0)` which clears `JCB+$78`
+- at those first natural hits:
+  - `A0 = $7038`
+  - `A3 = $70B0` at `$00122C/$001230`
+  - `A3 = $70B4` at `$001338`
+  - `USP = 0`
+  - `JCB+$78/$70B0 = 0`
+  - `JCB+$7C/$70B4 = 0`
+
+That keeps the old “zero `USP` / broken runnable-chain producer” diagnosis
+alive, but one important continuity assumption is now false:
+
+- the older one-shot `USP=$00032400` seed at `$006B7A` no longer drives the
+  current tree into the deeper repaired late `AMOSL.INI` path
+- on today’s code it instead stabilizes in a later runnable-chain loop:
+  - `$0013D2 = MOVE USP,A6`
+  - `$0013F2 = MOVE.L 120(A6),D7`
+  - `$0013F6 = BEQ ...`
+  - `$0013F8 = MOVEA.L D7,A6`
+  - `$0013FA = BRA $0013F2`
+- even on that seeded path:
+  - `last_lba` is still `3326`
+  - `last_a086_pc` stays zero
+  - `saw_55aa`, `saw_56BC`, and `saw_56D2` stay false
+
+So the real current target is not “reuse the old USP workaround.” It is:
+
+1. explain the natural producer-side state at `$00122C/$001230/$001338`
+2. explain why the seeded path only advances to the `$0013D2/$0013FA`
+   runnable-chain loop on the current tree
+3. only then revisit whether an emulator change around `USP` provenance,
+   reset modeling, or supervisor/user transitions is justified
+
 The highest-value native change on 2026-03-24 is the new timer block at
 `$FFFE60-$FFFE67`. The monitor is using that block on the clean
 `cpu_model=68020` path, so the older “missing MC6840/PTM wake” framing was
@@ -500,3 +597,53 @@ See `memory/bugs.md` for full list. Key categories:
 ## Branch
 
 `feature/native-boot-milestones` — many uncommitted changes in main.py and other files.
+
+## 2026-03-25 Native Update
+
+Two more native exception fixes are now in place:
+
+- [alphasim/cpu/exceptions.py](/Volumes/RAID0/repos/am_emulator/alphasim/cpu/exceptions.py)
+  now gives vector `8` the normal `68000` short frame `[SR][PC]` again; the
+  native privilege helper at `$000AFC` depends on that layout when it reads the
+  fault PC with `MOVEA.L 6(A7),A1`
+- the same file now preserves supervisor mode on `RTE` from the low-byte SR
+  patch helpers at `$003DDA/$003DE2`
+- [tests/cpu/test_rte.py](/Volumes/RAID0/repos/am_emulator/tests/cpu/test_rte.py)
+  covers both quirks
+
+This removes the old bogus jump into the RAM memtest fill pattern at
+`$010000` and eliminates the previous late low-memory corruption path for the
+real `AMOS_1-3_Boot_OS.img` run. The corrected native privilege helper now sees
+`A1=$00001290` at `$000B04` instead of the broken `$12900000/$12900009`.
+
+Current real-boot frontier on `cpu_model=68020`:
+
+- after `12,000,000` instructions, the machine is stably at:
+  - `PC=$001278`
+  - `A7=$000006F2`
+  - `SR=$2704`
+  - `JOBCUR=$00000000`
+  - `SVSTK=$000006F4`
+- disk reads still stop at `LBA 3326`
+- `AMOSL.INI` would still begin at `LBA 3335`, and no read reaches it yet
+- there is still no native ACIA TX
+
+The hot-PC profile from `5M..12M` instructions is now a stable scheduler /
+interrupt-window loop:
+
+- `$001250`
+- `$001254`
+- `$001256`
+- `$001258`
+- `$001274`
+- `$001278`
+- `$00127C`
+- `$00128C`
+- `$001294`
+- `$00129A`
+
+So the next blocker is no longer “late stack/sysvar corruption.” It is the
+natural native job/scheduler handoff during pre-`AMOSL.INI` filesystem /
+command-file work: why `JOBCUR` stays zero in that loop instead of
+transitioning to the next command-file/file-load stage and the first
+`AMOSL.INI` read.
