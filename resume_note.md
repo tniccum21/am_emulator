@@ -740,6 +740,35 @@ The blocker is that `JCB+$7C` (USP save) is never initialized. Options:
 4. **Check `$A038` handler**: called twice during init as `$17B4`. This
    might be the terminal attachment that sets up the user-mode context.
 
+### Comparison with 68020 path
+
+The 68020 selector image (`HD0-V1.4C-Bootable-on-1400.img`) shows the
+**exact same behavior**: JCB+$7C = 0 at 12M instructions. Both monitors
+enter the scheduler without setting up user-mode context. The earlier
+resume_note data showing JCB+$7C=$B440 on the 68020 path was from a much
+longer run that hasn't been reproduced on the current tree.
+
+### Root cause: missing terminal input
+
+The monitor is waiting for an **ACIA event** (terminal character or carrier
+detect) to trigger user-mode context creation. On a real AM-1200:
+1. Terminal sends character or asserts DCD
+2. ACIA generates level-1 interrupt
+3. Monitor's terminal handler fires
+4. Handler attaches terminal to JCB, sets JCB+$7C, creates user context
+5. Scheduler dispatches COMINT to user mode
+6. COMINT reads AMOSL.INI
+
+In the emulator, step 1 never happens — no terminal input arrives. The
+monitor sits in the scheduler idle loop forever.
+
+### Proposed fix
+
+Inject terminal input (a character or carrier detect assertion) into ACIA
+port 0 during the scheduler idle loop. This simulates a terminal
+connection. The monitor should detect it and proceed with terminal
+attachment and user-mode context creation.
+
 ### Quick commands
 
 ```bash
@@ -751,4 +780,5 @@ python3 trace_scheduler_idle.py
 python3 trace_job_execution.py
 python3 trace_timer_writes.py
 python3 trace_bit13.py
+python3 trace_68020_jcb7c.py
 ```
