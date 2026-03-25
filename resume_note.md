@@ -610,3 +610,145 @@ Results:
 
 - `tests/cpu/test_rte.py` -> `4 passed`
 - integration subset -> `22 passed, 1 skipped, 1 deselected`
+
+## 2026-03-25 Scheduler Deep Dive
+
+### Summary
+
+A deep investigation of the scheduler idle loop on the real boot image
+(`AMOS_1-3_Boot_OS.img`) revealed the complete mechanism and the current
+blocker. The scheduler IS working correctly — the issue is that the job's
+user-mode context is never initialized.
+
+### What IS working
+
+1. **MC6840 timer**: Programmed by loaded monitor at `$008280-$0082A4`.
+   Level-6 interrupts fire ~26 times per 5M instructions (every ~83K
+   instructions). The timer code at `$001032/$001036` reloads the counter
+   each tick.
+
+2. **LINE-A dispatch**: The dispatch table at `$0712` is fully populated
+   with real handlers. IOINI (`$A03C`→`$12F4`), IOWAIT (`$A03E`→`$11DE`),
+   IOGET (`$A034`→`$1756`), TIMSET (`$A044`→`$1040`), SCHED
+   (`$A04E`→`$1524`), WAKE (`$A04C`→`$14EA`) all work.
+
+3. **Scheduler dispatch**: The dispatch code at `$12AE-$12F2` IS executing
+   every tick. It sets USP from `JCB+$7C`, calls a timer subroutine, calls
+   `($0514)+4`, restores all registers via MOVEM, and does RTE.
+
+4. **JCB status bit 13**: WAKE at `$14F8` sets bit 13 (dispatch-ready flag).
+   SCHED at `$1524` clears it ~62 instructions later (time slice expired).
+   This cycle repeats every tick.
+
+### What's NOT working
+
+The job at `$7038` never enters **user mode**. The entire scheduler loop
+runs in supervisor mode.
+
+Root cause: **`JCB+$7C` (the scheduler's USP save field) is zero.**
+
+The dispatch code at `$12B6` does `MOVE A6,USP` where A6 comes from
+`JCB+$7C`. Since `JCB+$7C = 0`, USP is set to 0. The stacked SR on the
+supervisor stack has S=1 (supervisor mode), so the RTE at `$12F2` stays in
+supervisor mode. The job runs monitor polling code at `$003428-$003456`
+briefly, then returns to the scheduler.
+
+The init code at `$008232` writes `JCB+$38 = $003E8000` (user stack
+allocation top), but the scheduler reads USP from `JCB+$7C`, not `$38`.
+These are different fields:
+- `JCB+$38`: initial user stack allocation (set by init)
+- `JCB+$7C`: scheduler's saved USP (never initialized → zero)
+
+### Why `JCB+$7C` is never set
+
+The monitor init at `$008196` creates the JCB manually (clears memory, sets
+individual fields) without using the `JOBBLD` system call (`$A008`,
+handler at `$28CC`). JOBBLD would presumably initialize `JCB+$7C` and
+create the initial user-mode stack frame. But JOBBLD is never called.
+
+The `SCHED` handler at `$001524` confirms the problem:
+```
+$1524: MOVE #$2700,SR
+$1528: SUBQ.L #1,($0450).W    ; decrement time slice counter
+$152C: BPL $1536               ; if positive → skip preemption
+$152E: MOVEA.L ($041C).W,A6
+$1532: ANDI.W #$DFFF,(A6)      ; clear bit 13 = preempt!
+$1536: RTE
+```
+`$0450` (time slice) = `$FFFF` (always negative), so SCHED immediately
+preempts after every WAKE. The dispatch window is only ~62 instructions.
+
+### The repeating cycle
+
+Every ~83K instructions:
+```
+$0014F8 (WAKE):   JCB_status $0000 → $2000  [sets bit 13]
+  ... scheduler dispatch runs for ~62 instructions ...
+$001532 (SCHED):  JCB_status $2000 → $0000  [clears bit 13]
+$0011F0:          JCB_status $0000 → $0008  [sets bit 3]
+$00130A (IOINI):  JCB_status $0008 → $0000  [clears bit 3]
+```
+
+### Key decoded addresses
+
+```
+$001250: TST.L ($041C).W         ; test JOBCUR
+$001254: BNE $00129C             ; if non-zero → process job
+$00129C: MOVEA.L ($041C).W,A0   ; A0 = JOBCUR
+$0012A0: TST.W ($0450).W        ; test force-dispatch flag
+$0012A4: BMI $0012AE            ; if negative → dispatch (ALWAYS taken, $0450=$FFFF)
+$0012A6: test JCB bit 13        ; (not reached due to BMI)
+$0012AE: MOVE.L $80(A0),D7      ; D7 = JCB+$80 (= $7724)
+$0012B2: MOVEA.L $7C(A0),A6     ; A6 = JCB+$7C (= $0000!)
+$0012B6: MOVE A6,USP            ; USP = 0!
+$0012EE: MOVEM.L (A7)+,all regs
+$0012F2: RTE                    ; returns to supervisor mode (stacked SR has S=1)
+```
+
+### I/O system call chain (per tick)
+
+The scheduler tick calls these LINE-A handlers:
+1. IOGET (`$A034`): allocate I/O channel → succeeds
+2. Set DDB callback to `$10E8`
+3. TIMSET (`$A044`): set timer
+4. IOWAIT (`$A03E`): wait for I/O
+5. Timer fires → callback at `$10E8` calls IOINI (`$A03C`)
+6. IOINI writes JOBCUR, clears JCB+$78, sets JCB+$84=$FFFFFFFF
+7. WAKE (`$A04C`): sets bit 13
+8. SCHED (`$A04E`): clears bit 13 (preempt)
+
+This loop repeats. IOINI here is a **reschedule operation**, not disk I/O.
+Zero SCSI writes occur after the ROM boot phase.
+
+### Next steps
+
+The blocker is that `JCB+$7C` (USP save) is never initialized. Options:
+
+1. **Find who should set `JCB+$7C`**: trace the ROM boot code or the
+   monitor init flow for writes to `$7038+$7C = $70B4`. If the ROM code
+   sets it, check if it's being overwritten by the JCB clear loop.
+
+2. **Check what `$A07A`/`$A07C` do during init**: these LINE-A calls at
+   `$324C`/`$32B2` are made once during the first dispatch. They might be
+   the calls that should set up the user-mode context but fail.
+
+3. **Check the stacked SR/PC**: the MOVEM/RTE at `$12EE/$12F2` restores
+   context from `A7=$7724`. Dump the stack at `$7724` to see what SR/PC
+   would be restored. If SR has S=0 and PC is a valid user entry point,
+   the dispatch would work — the problem is just USP.
+
+4. **Check `$A038` handler**: called twice during init as `$17B4`. This
+   might be the terminal attachment that sets up the user-mode context.
+
+### Quick commands
+
+```bash
+# Verify tests still pass
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/cpu/test_rte.py tests/integration -k 'not test_native_boot_reads_amosl_ini_before_terminal_output'
+
+# Run scheduler tracers
+python3 trace_scheduler_idle.py
+python3 trace_job_execution.py
+python3 trace_timer_writes.py
+python3 trace_bit13.py
+```
