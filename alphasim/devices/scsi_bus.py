@@ -316,12 +316,13 @@ class SCSIBusInterface(IODevice):
             pass
 
     def _complete_selection(self) -> None:
-        """Target responds to selection.
+        """Target responds to selection — enter COMMAND phase directly.
 
-        The low-memory monitor path expects an intermediate status value
-        ($14) after the first 00/00/01/11 handshake, then repeats the same
-        handshake before the device enters real COMMAND phase and accepts
-        CDB bytes.
+        Both the real-boot-image monitor (68010 path) and the selector-image
+        monitor (68020 path) use the same 00/01/11 selection sequence.  The
+        68010 monitor expects the bus to enter COMMAND phase with REQ
+        asserted immediately after the first handshake.  Go straight to
+        COMMAND phase rather than requiring a second handshake.
         """
         if self.target is None:
             # No target — stay bus free (selection timeout)
@@ -333,14 +334,7 @@ class SCSIBusInterface(IODevice):
             self._emit_trace("SCSI selection failed")
             return
 
-        self._selection_response_pending = True
-        self._phase = SCSIPhase.BUS_FREE
-        self._bsy = False
-        self._req = False
-        self._selecting = False
-        self._sel_step = 0
-        self._trace("Selection acknowledged -> pending command handshake")
-        self._emit_trace("SCSI selection acknowledged -> pending command")
+        self._enter_command_phase()
 
     def _enter_command_phase(self) -> None:
         """Enter COMMAND phase after the monitor's second selection handshake."""
