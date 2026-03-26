@@ -762,12 +762,50 @@ detect) to trigger user-mode context creation. On a real AM-1200:
 In the emulator, step 1 never happens — no terminal input arrives. The
 monitor sits in the scheduler idle loop forever.
 
+### The unreachable user-mode setup at $0036CE
+
+The code that would set up USP and create the user-mode context is at
+`$0036CE`. It does:
+```
+$0036CE: allocate $68 bytes ($A060)
+$0036DE: set device name = DSK ($1C03 RAD50)
+$0036E6: LINE-A $A080 (SRCH) — search for DSK device
+$0036F2: LINE-A $A0AA
+$00371C: MOVE A6,USP   ← THIS SETS THE USER STACK
+$003718: MOVEM to save initial user context
+```
+
+But `$0036CE` is NEVER REACHED because the init flow is:
+```
+$008314: BSR $0033A6    → wrapper for $A07A + $A07C
+$0033B2: LINE-A $A07A   → dispatches to $324C (RTC init)
+$003446: LINE-A $A04E   → SCHED (returns via RTE)
+$00344A: LINE-A $A046   → TIMCAN at $10B6
+$10DC:   LINE-A $A03E   → IOWAIT (BLOCKS — never returns)
+```
+
+The $A07A handler's RTC init code at `$325E` does delay loops, then
+calls SCHED + TIMCAN. TIMCAN enters IOWAIT which saves context and
+enters the scheduler wait loop. **IOWAIT never returns**, so the code
+after BSR `$0033A6` (`$00831A` timer setup + JMP `$0036CE`) is never
+executed.
+
 ### Proposed fix
 
-Inject terminal input (a character or carrier detect assertion) into ACIA
-port 0 during the scheduler idle loop. This simulates a terminal
-connection. The monitor should detect it and proceed with terminal
-attachment and user-mode context creation.
+The blocker is now identified as IOWAIT not returning from the TIMCAN
+handler. The timer IS firing and IOINI IS being called by the timer
+callback. But IOINI just reschedules — it never marks the I/O request
+as "complete", so IOWAIT stays blocked.
+
+This might be because:
+1. The TIMCAN handler's I/O wait expects a specific completion condition
+   that never occurs
+2. The timer callback path at $10E8 calls IOINI but doesn't set the
+   completion status correctly
+3. The scheduler's dispatch doesn't restore the IOWAIT context correctly
+
+Next step: trace exactly what IOWAIT checks to determine completion, and
+what the timer callback does vs what IOWAIT expects.
 
 ### Quick commands
 
