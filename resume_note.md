@@ -804,8 +804,33 @@ This might be because:
    completion status correctly
 3. The scheduler's dispatch doesn't restore the IOWAIT context correctly
 
-Next step: trace exactly what IOWAIT checks to determine completion, and
-what the timer callback does vs what IOWAIT expects.
+### Complete causal chain (updated 2026-03-26)
+
+The init code at `$0036CE` IS reached (at i=5,025,415). The flow:
+```
+$0036CE: MOVE.L #$68,-(A7)  → allocate $68 bytes ($A060) — OK
+$0036E6: LINE-A $A080       → SRCH for DSK device — OK, returns
+$0036F2: LINE-A $A0AA       → disk operation — ENTERS SCHEDULER, NEVER RETURNS
+$0036F4: MOVEA.L ($041C),A6 → NEVER REACHED (25M+ instructions)
+$0036F8: TST.L $18(A6)      → NEVER REACHED
+$003740: MOVE A6,USP         → NEVER REACHED
+```
+
+`$A0AA` (handler at `$4982`) enters IOWAIT via TIMSET/IOWAIT. The
+scheduler dispatches the job, but the dispatch always restores the
+TIMCAN-level context (IOWAIT's MOVEM save at JCB+$80=$7724), not the
+`$A0AA` handler's deeper stack frames. The `$A0AA` handler's context is
+buried below TIMCAN's on the stack and is never unwound.
+
+**Root cause**: the OS's SCSI disk driver is never invoked. All 78 disk
+reads are ROM-level direct SCSI polling. After the OS takes over, the
+I/O subsystem should dispatch DDBs to the disk driver, but:
+- IOINI at `$12F4` just reschedules (sets JOBCUR, clears JCB+$78)
+- It never dispatches the DDB to the driver
+- No new SCSI reads ever occur after ROM boot
+
+Next step: trace the I/O dispatch mechanism — what should cause the SCSI
+driver to be called with a DDB, and where in the chain does it break.
 
 ### Quick commands
 
