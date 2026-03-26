@@ -28,11 +28,15 @@ def test_selection_enters_command_phase_directly() -> None:
     assert scsi._cdb_index == 0
 
 
-def test_pending_dma_irq_reports_level_two() -> None:
+def test_pending_dma_irq_reports_level_five() -> None:
+    """SCSI DMA completion interrupts at level 5 (autovector 29).
+
+    The loaded monitor installs its SCSI completion ISR at vector 29.
+    """
     scsi = SCSIBusInterface()
 
     assert scsi.get_interrupt_level() == 0
 
     scsi._irq_pending = True
 
-    assert scsi.get_interrupt_level() == 2
+    assert scsi.get_interrupt_level() == 5

@@ -189,12 +189,15 @@ class SCSIBusInterface(IODevice):
                     self._emit_trace("SCSI IRQ pending")
 
     def get_interrupt_level(self) -> int:
-        return 2 if self._irq_pending else 0
+        # The loaded monitor installs its SCSI completion ISR at vector 29
+        # (autovectored level 5, handler at $006C18).  The ROM's default
+        # handler at vector 26 (level 2) is a stub that doesn't process
+        # DDB completion.  Level 5 matches the SASI controller's interrupt
+        # level and is where the monitor expects SCSI DMA events.
+        return 5 if self._irq_pending else 0
 
     def get_interrupt_vector(self) -> int:
-        # AM-1200 SCSI DMA completion uses autovectored level-2 interrupt.
-        # Return 0 so the CPU uses the autovector (vector 26, address $068).
-        # The loaded monitor/driver installs its ISR in that vector slot.
+        # Autovectored — return 0 so the CPU uses vector 29 (24 + level 5).
         return 0
 
     def acknowledge_interrupt(self, level: int) -> None:
