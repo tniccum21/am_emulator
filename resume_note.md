@@ -829,8 +829,35 @@ I/O subsystem should dispatch DDBs to the disk driver, but:
 - It never dispatches the DDB to the driver
 - No new SCSI reads ever occur after ROM boot
 
-Next step: trace the I/O dispatch mechanism — what should cause the SCSI
-driver to be called with a DDB, and where in the chain does it break.
+### Bypass experiment: skipping $A0AA
+
+Skipping the LINE-A `$A0AA` at `$0036F2` (advancing PC to `$0036F4`)
+confirms the diagnosis:
+
+- **JCB+$7C = $00007AC2** — USP is set!
+- **LED $12 appears** — new boot milestone
+- **USP = $00007AC2** — non-zero
+
+The code at `$003720` → `$003740` (`MOVE A6,USP`) executes successfully.
+The skip path works because JCB+$18 = 0 (no terminal link), which is the
+expected path for headless/initial boot.
+
+**Conclusion**: `$A0AA` (disk mount/init) is the SOLE blocker. Everything
+else in the init chain works. The fix is to make the OS disk I/O subsystem
+complete the `$A0AA` request.
+
+The DDB at `$182A` is queued but never dispatched to a driver:
+- DDB+$08 = $7038 (owner JCB)
+- DDB+$0C = $3E817C (data buffer)
+- DDB chain processing code at `$14FE` is never reached
+- DD.XFR at `$1D10` is never reached
+- No SCSI writes occur after ROM boot
+
+Next step: implement a mechanism to complete the `$A0AA` I/O request,
+either by:
+1. Installing a minimal disk driver that IOINI dispatches to
+2. Fixing the DDB chain processing so `$14FE` is called
+3. Making the IOINI handler detect DDB-based requests and perform them
 
 ### Quick commands
 
