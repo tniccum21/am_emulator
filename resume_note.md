@@ -853,11 +853,28 @@ The DDB at `$182A` is queued but never dispatched to a driver:
 - DD.XFR at `$1D10` is never reached
 - No SCSI writes occur after ROM boot
 
-Next step: implement a mechanism to complete the `$A0AA` I/O request,
-either by:
-1. Installing a minimal disk driver that IOINI dispatches to
-2. Fixing the DDB chain processing so `$14FE` is called
-3. Making the IOINI handler detect DDB-based requests and perform them
+### The actual hardware blocker: SCSI bus REQ polling
+
+The `$A0AA` handler's FETCH calls succeed (disk data was cached from ROM
+boot). But then the handler enters the SCSI driver at `$006BBE` which
+polls `$FFFFC8` (SCSI bus interface) for REQ (bit 1):
+
+```
+$006BBE: MOVE.B ($FFFFC8),D7   ; SCSI bus status = $14 (BSY+C/D)
+$006BC0: ANDI.B #$02,D7        ; isolate REQ
+$006BC4: BNE $006BD4           ; exit if REQ asserted
+$006BC6: TST.L 8(A2)           ; check timeout
+$006BCA: BEQ $006BBE           ; loop (timeout not fired)
+```
+
+A5=`$FFFFFFC8` (SCSI bus, NOT ACIA). Status `$14` has BSY+C/D but
+no REQ. **Zero SCSI writes occur after ROM boot** — the OS driver
+never sends a SCSI command. The poll loops forever.
+
+Next step: figure out what SCSI command should have been sent before
+the poll loop, and why the driver skips the command phase. The code
+at `$006BA0-$006BBC` sets up a timeout and immediately polls — no
+SCSI command write between TIMSET and the poll.
 
 ### Quick commands
 
