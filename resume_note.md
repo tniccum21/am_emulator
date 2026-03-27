@@ -129,6 +129,11 @@ loaded memory — no code in the IDV, kernel, TDV, or user space
 ever calls COMINT. The AM1000.IDV simply doesn't register its
 interrupt routines.
 
+Exhaustive trace of ALL 2641 writes to TCB $856E-$85F0 confirms:
+T.INC/T.OTC/T.EXC are cleared at i=5221618 and NEVER written again.
+Neither the 1.3 nor 1.4 disk image contains $A0F8 in loaded code.
+The 1.4 image uses AM130.IDV (not AM1200) — same issue.
+
 Complete failure chain:
 1. IDV doesn't call COMINT ($A0F8) → T.INC/T.OTC = 0
 2. No T.INC → received chars discarded → no terminal attachment
