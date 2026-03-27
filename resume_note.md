@@ -89,8 +89,34 @@ identification test at `$3E878C` passes (D7 matches `$043C`). But
 no subsequent handler writes JOBTRM through 300 instructions of
 kernel/IDV processing.
 
-The missing JOBTRM write might require a hardware response (ACIA
-echo or status change) that doesn't occur in the emulator.
+### T.INC / T.OTC never set (2026-03-27)
+
+The ACIA handler at `$88D4` reads `TCB+$62` (T.INC = input routine
+pointer). **T.INC = $00000000** — the entire TCB I/O routine area
+(+$58 through +$70) is all zeros. No writes occur to this area.
+
+When RDRF is set, the handler takes the RDRF path at `$88D4`:
+```
+MOVE.L $62(A5),D7    ; D7 = T.INC = $00000000
+BEQ    $890A          ; zero → skip input processing, discard char
+```
+
+From Appendix B: "T.INC should be set via the COMINT monitor call"
+(Chapter 16). The COMINT call registers TRMSER's input/output
+character processing routines. This call is never made or fails.
+
+Without T.INC:
+- Input characters are discarded (handler skips to $890A)
+- No terminal attachment occurs (TRMSER never processes input)
+- JOBTRM stays zero
+
+Without T.OTC:
+- Output characters can't be written to the ACIA at interrupt level
+- The output chain never starts
+
+Next step: read Chapter 16 (Serial Communications System) for the
+COMINT monitor call and find its LINE-A opcode. Then trace if/when
+it's called and why it fails to set T.INC.
 
 ## Key Decoded Addresses
 
