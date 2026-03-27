@@ -42,11 +42,34 @@ But zero TX output because TTYOUT → $A00A → IOGET → DDB queued but
 DDB dispatch at $14FE never runs. Characters go through the I/O chain
 but are never flushed to the ACIA.
 
-### Next step: DDB dispatch
+### TCB discovery (2026-03-27)
 
-The DDB processing code at `$14FE` walks DDBCHN and dispatches DDBs to
-device drivers (including the terminal/ACIA driver). This code is never
-called. Finding what should trigger it is the key to terminal output.
+The TCB exists at `$856E` with correct data:
+- T.IHW = `$FFFE20` (ACIA port 0)
+- T.JLK = `$7038` (→ JCB, bidirectional link attempt)
+- AM1000.IDV loaded from disk at i=5,224,350
+- WYSE.TDV loaded from disk at i=5,243,329
+- Buffer size = 100 (from TRMDEF `100,100,100`)
+
+But T.STS = `$0080`:
+- **T$ASN ($200) NOT set** → terminal not assigned → can't attach
+- T$DIS ($400) not set → not disabled
+- T$OIP ($80) set → "output in progress" stuck from init
+
+JOBTRM is NEVER written to a non-zero value. The TCB→JCB link
+(T.JLK=$7038) exists but the JCB→TCB link (JOBTRM) is never set
+because T$ASN is false.
+
+The 66 TTYOUT calls with D6=$503 are trace/command-file output
+(`:T` trace mode), not terminal TTY. Real terminal attachment
+happens when COMINT calls EXIT or KBD after INI processing.
+
+### Next step
+
+Find what condition in the AM1000 IDV probe determines T$ASN.
+The handler at $8844 reads ACIA status $86 (correct) but doesn't
+set T$ASN. The probe might need the ACIA to echo a test byte, or
+some other hardware response that the emulator doesn't provide.
 
 ## Key Decoded Addresses
 
