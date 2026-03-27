@@ -90,7 +90,7 @@ class ACIA6850(IODevice):
 
         # Double-buffered TX: TDR (data register) + TSR (shift register)
         self._tdre = [True, True, True]       # Transmit Data Register Empty
-        self._tx_ever = [False, False, False]  # True after first TX write since reset
+        self._tx_irq_pending = [False, False, False]  # Edge-triggered TX IRQ latch
         self._tdr = [0x00, 0x00, 0x00]        # Transmit Data Register contents
         self._tdr_full = [False, False, False] # TDR has data waiting for TSR
         self._tsr_active = [False, False, False]  # TSR is shifting a byte out
@@ -194,6 +194,12 @@ class ACIA6850(IODevice):
             if self._is_master_reset(port):
                 return 0x00
 
+            # Clear TX IRQ latch on status read (edge-triggered model).
+            # The handler at $8844 reads status via MOVE.B (A4),D1.
+            # After reading, the TX IRQ is suppressed until the next
+            # TDRE transition (byte written and shifted out).
+            self._tx_irq_pending[port] = False
+
             status = 0x00
             # Bit 0: RDRF
             if self._rdrf[port]:
@@ -264,7 +270,7 @@ class ACIA6850(IODevice):
                 self._rdrf[port] = False
                 self._ovrn[port] = False
                 self._tdre[port] = True
-                self._tx_ever[port] = False
+                self._tx_irq_pending[port] = False
                 self._tdr_full[port] = False
                 self._tsr_active[port] = False
                 self._tsr_countdown[port] = 0
@@ -279,6 +285,16 @@ class ACIA6850(IODevice):
                 self._auto_config_countdown[port] = 0
                 self._trace(f"Port {port} control = ${value:02X}")
 
+            # When TX IRQ is newly enabled (transition), assert the TX
+            # IRQ latch if TDRE is already set.  This models the real
+            # 6850 behavior where enabling TX IRQ with TDRE=1 generates
+            # an immediate interrupt request.
+            old_tx_irq = (old_cr & 0x60) == 0x20
+            new_tx_irq = (value & 0x60) == 0x20
+            if new_tx_irq and not old_tx_irq and self._tdre[port]:
+                self._tx_irq_pending[port] = True
+                self._trace(f"Port {port} TX IRQ enabled with TDRE → pending")
+
             # NOTE: Real MC6850 does NOT flush RX state on RX IRQ enable.
             # Enabling CR bit 7 simply allows pending RDRF to generate an
             # IRQ.  Any stale echo data must be handled by the OS (e.g.
@@ -288,7 +304,6 @@ class ACIA6850(IODevice):
 
         elif reg_type == "data":
             # Transmit data — double-buffered TX
-            self._tx_ever[port] = True
             self._tx_output[port].append(value)
             self._trace(f"Port {port} TX: ${value:02X} ({chr(value) if 0x20 <= value < 0x7F else '?'})")
             if self.tx_callback:
@@ -298,6 +313,7 @@ class ACIA6850(IODevice):
                 # TSR is idle: byte goes directly to shift register
                 self._start_shift(port, value)
                 self._tdre[port] = True  # TDR is empty (byte went straight to TSR)
+                self._tx_irq_pending[port] = True  # TDRE edge → TX IRQ
             else:
                 # TSR is active: byte goes to TDR (buffer)
                 self._tdr[port] = value
@@ -329,6 +345,7 @@ class ACIA6850(IODevice):
                     if self._tdr_full[i]:
                         self._tdr_full[i] = False
                         self._tdre[i] = True  # TDR is now empty
+                        self._tx_irq_pending[i] = True  # TDRE edge → TX IRQ
                         self._start_shift(i, self._tdr[i], from_tdr=True)
                     # else: TSR idle, TDRE already reflects TDR state
 
@@ -382,7 +399,7 @@ class ACIA6850(IODevice):
             if self._rdrf[port] and self._rx_irq_enabled(port):
                 return 2
             if (self._tx_irq_enabled(port) and self._tdre[port]
-                    and self._tx_ever[port]):
+                    and self._tx_irq_pending[port]):
                 return 2
         return 0
 
