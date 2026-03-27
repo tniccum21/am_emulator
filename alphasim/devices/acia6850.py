@@ -223,12 +223,10 @@ class ACIA6850(IODevice):
             if (self._control[port] & 0x60) == 0x40:
                 status |= 0x08
             # Bit 4: FE -- Framing Error.
-            # The AM-1200 port driver checks for specific status patterns
-            # that include FE=1 when no valid data is in the receive register.
-            # This dynamic behavior (FE=1 when RDRF=0) matches what the
-            # hardware presents when the serial line has noise/no data.
-            if not self._rdrf[port]:
-                status |= 0x10
+            # On a real 6850, FE is latched when a received byte has
+            # incorrect stop bits.  With no data received (RDRF=0), FE
+            # should be clear.  The AM1000 interface driver checks FE
+            # during terminal probe and disables the port if FE is set.
             # Bit 5: OVRN
             if self._ovrn[port]:
                 status |= 0x20
