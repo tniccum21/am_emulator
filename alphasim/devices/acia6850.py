@@ -90,6 +90,7 @@ class ACIA6850(IODevice):
 
         # Double-buffered TX: TDR (data register) + TSR (shift register)
         self._tdre = [True, True, True]       # Transmit Data Register Empty
+        self._tx_ever = [False, False, False]  # True after first TX write since reset
         self._tdr = [0x00, 0x00, 0x00]        # Transmit Data Register contents
         self._tdr_full = [False, False, False] # TDR has data waiting for TSR
         self._tsr_active = [False, False, False]  # TSR is shifting a byte out
@@ -263,6 +264,7 @@ class ACIA6850(IODevice):
                 self._rdrf[port] = False
                 self._ovrn[port] = False
                 self._tdre[port] = True
+                self._tx_ever[port] = False
                 self._tdr_full[port] = False
                 self._tsr_active[port] = False
                 self._tsr_countdown[port] = 0
@@ -275,14 +277,6 @@ class ACIA6850(IODevice):
             elif (old_cr & 0x03) == 0x03:
                 # Coming out of reset — cancel any pending auto-configure
                 self._auto_config_countdown[port] = 0
-                # Simulate terminal present: on real hardware a connected
-                # terminal drives the RX line, so as soon as the port exits
-                # master reset the ACIA detects a start bit and RDRF asserts.
-                # This models the terminal's idle-line or greeting byte.
-                if port == 0 and not self._rdrf[port]:
-                    self._rx_data[port] = 0x0D  # CR
-                    self._rdrf[port] = True
-                    self._trace(f"Port {port} terminal present (RDRF set)")
                 self._trace(f"Port {port} control = ${value:02X}")
 
             # NOTE: Real MC6850 does NOT flush RX state on RX IRQ enable.
@@ -294,6 +288,7 @@ class ACIA6850(IODevice):
 
         elif reg_type == "data":
             # Transmit data — double-buffered TX
+            self._tx_ever[port] = True
             self._tx_output[port].append(value)
             self._trace(f"Port {port} TX: ${value:02X} ({chr(value) if 0x20 <= value < 0x7F else '?'})")
             if self.tx_callback:
@@ -366,19 +361,38 @@ class ACIA6850(IODevice):
                 self._echo_pending[i] = new_pending
 
     def get_interrupt_level(self) -> int:
-        """ACIA generates IPL 1 interrupts."""
+        """ACIA generates level-2 interrupts on the AM-1200.
+
+        The loaded monitor's TRMDEF command installs its ACIA handler at
+        vector 26 (autovectored level 2, address $0068).  The handler at
+        $8844 processes terminal I/O by dispatching pending DDBs to the
+        ACIA data register.
+
+        TX IRQ: the 6850 asserts IRQ when TDRE is set and TX IRQ is
+        enabled.  However, TDRE is set by default (data register empty).
+        If TX IRQ is enabled before any data is written, the interrupt
+        fires immediately with nothing to transmit, causing a livelock
+        when the handler doesn't disable the IRQ.  Gate TX IRQ on
+        prior TX activity: only assert after at least one byte has been
+        written to the data register since the last master reset.
+        """
         for port in range(3):
             if self._is_master_reset(port):
                 continue
             if self._rdrf[port] and self._rx_irq_enabled(port):
-                return 1
-            if self._tx_irq_enabled(port):
-                return 1
+                return 2
+            if (self._tx_irq_enabled(port) and self._tdre[port]
+                    and self._tx_ever[port]):
+                return 2
         return 0
 
     def get_interrupt_vector(self) -> int:
-        """ACIA provides vector 64 during IACK (IPL 1 -> vector 64)."""
-        return 64
+        """ACIA uses autovectored level-2 interrupts on the AM-1200.
+
+        Return 0 so the CPU uses the autovector (vector 26, address $068).
+        TRMDEF installs its terminal I/O handler at this vector.
+        """
+        return 0
 
     def acknowledge_interrupt(self, level: int) -> None:
         """IACK -- ACIA interrupt is level-sensitive, cleared by reading status."""
