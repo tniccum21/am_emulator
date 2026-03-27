@@ -71,12 +71,18 @@ processes AMOSL.INI commands:
   - $03 (reset) → $95 (RX IRQ, 8N1) → $B5 (TX+RX IRQ)
   - TRMATT ($A038) called, allocates terminal channel $182E
 - 19 FIND calls, 35 FETCH calls, 66 TTYOUT calls
+- AM1000.IDV loaded from DSK0:[1,6] (LBA 1275)
+- WYSE.TDV loaded from DSK0:[1,6] (LBA 3329)
+- TCB created at $856E with T.IHW=$FFFE20, T.JLK=$7038
+- Console identification test at $3E878C passes
 
-**Current blocker**: TTYOUT ($A0CA) is called 66 times with real characters
-(e.g. 'M' = $4D) but produces zero ACIA output. The TTYOUT handler path:
-`$A0CA → $A00A → IOGET → DDB queued` — characters enter the DDB/I/O
-chain but the DDB dispatch code at $14FE (which flushes DDBs to device
-drivers including the ACIA) is never called.
+**Current blocker**: JOBTRM (JCB terminal pointer) is never set. The TCB
+exists and the console is identified, but the bidirectional link
+(JOBTRM↔T.JLK) is never completed. Without JOBTRM, TTY/TOUT calls
+through TRMSER can't find the terminal and output is silently discarded.
+
+The 66 TTYOUT calls with D6=$503 are trace/command-file output (`:T`
+trace mode), not terminal TTY calls through TRMSER.
 
 #### Key Hardware Fixes (2026-03-25/26)
 
