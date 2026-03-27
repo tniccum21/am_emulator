@@ -114,9 +114,19 @@ Without T.OTC:
 - Output characters can't be written to the ACIA at interrupt level
 - The output chain never starts
 
-Next step: read Chapter 16 (Serial Communications System) for the
-COMINT monitor call and find its LINE-A opcode. Then trace if/when
-it's called and why it fails to set T.INC.
+From Chapter 16 (Serial Communications System):
+- **COMINT** sets T.INC (input char routine) and T.OTC (output char
+  routine) in the TCB. These are interrupt-level callbacks.
+- **TINIT** kicks off output: places char in buffer, calls TINIT,
+  which triggers T.OTC at interrupt level to write to ACIA.
+- The AM1000.IDV should call COMINT during init to register its
+  routines. It doesn't → T.INC/T.OTC stay zero.
+
+Complete failure chain:
+1. IDV doesn't call COMINT → T.INC/T.OTC = 0
+2. No T.INC → received chars discarded → no terminal attachment
+3. No T.OTC → output chain can't start → no ACIA writes
+4. No attachment → JOBTRM = 0 → TTY enters Tw wait forever
 
 ## Key Decoded Addresses
 
