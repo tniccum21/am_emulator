@@ -1,6 +1,6 @@
 # Resume Note
 
-Last updated: 2026-03-26
+Last updated: 2026-03-27
 Branch: `feature/native-boot-milestones`
 
 ## Current State
@@ -25,9 +25,10 @@ major progress. Two SCSI bus fixes unblocked the entire OS I/O chain:
 
 ### What doesn't work yet
 
+- **Asynchronous disk I/O**: TRMDEF FETCH for WYSE.TDV enters IOWAIT
+  but the scheduler never delivers I/O completion → job hangs
 - No terminal output (ACIA TX callback never fires)
-- No user-mode dispatch confirmed (need to verify stacked SR has S=0)
-- COMINT has not started processing AMOSL.INI commands
+- TRMDEF never completes → TDV never linked → JOBTRM never set
 
 ### What happens after USP is set
 
@@ -64,81 +65,82 @@ The 66 TTYOUT calls with D6=$503 are trace/command-file output
 (`:T` trace mode), not terminal TTY. Real terminal attachment
 happens when COMINT calls EXIT or KBD after INI processing.
 
-### Exact failure point: IDV signature check
+### IDV signature check (informational only)
 
-The AM1000 IDV code at `$008A5E` does:
+The AM1000 IDV code at `$008A5E` checks `$66FD83EF` = RAD50 "PSEUDO".
+This is informational only (outputs "System not available" message)
+and does NOT block terminal assignment. The IDV `$0400` flag is a
+capability bit (not T$DIS). Console ID test at `$3E878C` passes.
+
+### T.INC / T.OTC = 0 is NORMAL (2026-03-27)
+
+The AM130.IDV source code reveals T.INC=0 and T.OTC=0 is the
+**normal case** — when zero, the ISR uses the built-in TRMICP/TRMOCP
+macros from TRMSER. The IDV installs its ISR directly into the CPU
+vector table, not through COMINT. COMINT ($A0F8) is for the AM-350
+intelligent I/O controller, not standard serial ports.
+
+### Actual blocker: TRMDEF stuck in scheduler (2026-03-27)
+
+The TRMDEF handler at `$3E8xxx` processes:
+1. TCB clear at `$3E83B2` (i=5221384)
+2. IDV load: BSR `$3E91B4` at `$3E84B0` → loads AM1000.IDV → links
+   T.IDV = `$89F4` at `$3E84EA`
+3. **TDV load attempt**: BSR `$3E91B6` at `$3E84B0` returns to the
+   **scheduler idle loop** at `$001250`. The FETCH for WYSE.TDV
+   triggers a disk I/O that enters IOWAIT. The scheduler spins
+   decrementing D7 from `$0E34` but the I/O never completes.
+
+The TRMDEF code **never reaches the TDV linking code** because the
+job is stuck waiting for the disk I/O to complete. As a result:
+- T.TDV (TCB+$16) stays zero — TDV never linked
+- TCB+$76 stays zero — no TCRT dispatch table
+- The IDV INIT at `$3E8766` (JMP 2(A0) → $89F6) never runs properly
+
+### JOBTRM gate mechanism (2026-03-27)
+
+The LINE-A handler at `$001FCA` (called 85 times) decides JOBTRM:
 ```
-CMPI.L #$66FD83EF,-4(A6)   ; A6 = TCB+$4C = $91BC
-BEQ    $008A7E               ; if match → success (set T$ASN)
-                              ; Z=0 → MISMATCH → error path
+$001FCA: MOVEM.L ...           ; save regs
+$001FCE: MOVEA.L ($041C).W,A0  ; A0 = JCB
+$001FD2: MOVEA.L $38(A0),A5    ; A5 = TCB (from JCB+$38)
+$001FD6: MOVE.L A5,D7          ; test if TCB exists
+$001FD8: BNE $001FE4           ; yes → continue
+$001FE4: MOVEA.L $0E(A5),A4    ; A4 = T.IDV
+$001FE8: TST.W D1              ; test function code
+$001FF0: BCC $00201C            ; D1 >= $FF00 → check dispatch
+$00201C: MOVE.L $76(A5),D7     ; D7 = TCB+$76 (dispatch table)
+$002020: BEQ $00200E            ; if zero → EXIT (skip JOBTRM!)
+$002022: MOVEA.L D7,A6          ; A6 = dispatch table
+$002024: CLR.L D7
+$002026: MOVE.B D1,D7           ; function index
+$002028: LSL.L #1,D7            ; word offset
+$00202A: MOVE.W (A6,D7.W),D7   ; read dispatch entry
+$002030: MOVE.W D7,D1           ; new function code
 ```
 
-Value at `$91B8`: `$00000064` (= 100, a buffer size parameter)
-Expected: `$66FD83EF` (driver module signature)
+TCB+$76 = `$00000000` because TRMDEF never completed TDV loading.
+Every call to this handler skips at `$002020` → JOBTRM never set.
 
-The signature `$66FD83EF` doesn't exist ANYWHERE in loaded data.
-WYSE.TDV escape sequences ARE loaded at `$92EA`, but TCB+$4C
-(`$91BC`) points to a parameter block, not the driver entry point.
+### Root cause chain (updated 2026-03-27)
 
-Update: `$66FD83EF` = RAD50 "PSEUDO" — the check compares the TDV
-name with PSEUDO. This is informational only (outputs "System not
-available" message) and does NOT block terminal assignment.
+1. TRMDEF calls FETCH to load WYSE.TDV from DSK0:[1,6]
+2. FETCH triggers disk I/O via IOINI → enters IOWAIT
+3. Scheduler runs but I/O completion never signals → job sleeps forever
+4. TRMDEF never reaches TDV linking code
+5. T.TDV = 0, TCB+$76 = 0 (no TCRT dispatch table)
+6. Terminal handler at $001FCA always skips at $002020
+7. JOBTRM never set → VER enters Tw wait forever
 
-The IDV `$0400` flag is a capability bit (not T$DIS). The console
-identification test at `$3E878C` passes (D7 matches `$043C`). But
-no subsequent handler writes JOBTRM through 300 instructions of
-kernel/IDV processing.
+The fundamental issue is the **OS disk I/O chain**: IOINI dispatches
+I/O but the completion path (DD.XFR → driver → IOWAIT wake) never
+fires. This is the same problem as the FIND D6=2 failure — the OS
+I/O subsystem hangs because I/O completions are not delivered.
 
-### T.INC / T.OTC never set (2026-03-27)
-
-The ACIA handler at `$88D4` reads `TCB+$62` (T.INC = input routine
-pointer). **T.INC = $00000000** — the entire TCB I/O routine area
-(+$58 through +$70) is all zeros. No writes occur to this area.
-
-When RDRF is set, the handler takes the RDRF path at `$88D4`:
-```
-MOVE.L $62(A5),D7    ; D7 = T.INC = $00000000
-BEQ    $890A          ; zero → skip input processing, discard char
-```
-
-From Appendix B: "T.INC should be set via the COMINT monitor call"
-(Chapter 16). The COMINT call registers TRMSER's input/output
-character processing routines. This call is never made or fails.
-
-Without T.INC:
-- Input characters are discarded (handler skips to $890A)
-- No terminal attachment occurs (TRMSER never processes input)
-- JOBTRM stays zero
-
-Without T.OTC:
-- Output characters can't be written to the ACIA at interrupt level
-- The output chain never starts
-
-From Chapter 16 (Serial Communications System):
-- **COMINT** sets T.INC (input char routine) and T.OTC (output char
-  routine) in the TCB. These are interrupt-level callbacks.
-- **TINIT** kicks off output: places char in buffer, calls TINIT,
-  which triggers T.OTC at interrupt level to write to ACIA.
-- The AM1000.IDV should call COMINT during init to register its
-  routines. It doesn't → T.INC/T.OTC stay zero.
-
-**Definitive finding**: LINE-A `$A0F8` = COMINT (handler at `$6740`).
-LINE-A `$A0FA` = TINIT (handler at `$674E`). Both are implemented
-and in the LINE-A table. But `$A0F8` does NOT appear ANYWHERE in
-loaded memory — no code in the IDV, kernel, TDV, or user space
-ever calls COMINT. The AM1000.IDV simply doesn't register its
-interrupt routines.
-
-Exhaustive trace of ALL 2641 writes to TCB $856E-$85F0 confirms:
-T.INC/T.OTC/T.EXC are cleared at i=5221618 and NEVER written again.
-Neither the 1.3 nor 1.4 disk image contains $A0F8 in loaded code.
-The 1.4 image uses AM130.IDV (not AM1200) — same issue.
-
-Complete failure chain:
-1. IDV doesn't call COMINT ($A0F8) → T.INC/T.OTC = 0
-2. No T.INC → received chars discarded → no terminal attachment
-3. No T.OTC → output chain can't start → no ACIA writes
-4. No attachment → JOBTRM = 0 → TTY enters Tw wait forever
+Note: The first 207 SCSI reads (ROM boot + disk mount) all work
+because they use synchronous I/O through the monitor's SCSI driver.
+The TRMDEF FETCH is the first attempt at **asynchronous disk I/O**
+through the scheduler, and it fails.
 
 ## Key Decoded Addresses
 

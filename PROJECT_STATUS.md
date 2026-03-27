@@ -1,6 +1,6 @@
 # AlphaSim AM-1200 Emulator — Project Status
 
-Last updated: 2026-03-26
+Last updated: 2026-03-27
 
 ## Overview
 
@@ -76,16 +76,26 @@ processes AMOSL.INI commands:
 - TCB created at $856E with T.IHW=$FFFE20, T.JLK=$7038
 - Console identification test at $3E878C passes
 
-**Current blocker**: The AM1000 interface driver never calls the COMINT
-monitor call to register T.INC (input char routine) and T.OTC (output
-char routine) in the TCB. Without these interrupt-level callbacks:
-- Received ACIA characters are discarded (handler at $88D4 skips on
-  T.INC=0)
-- Output chain can't start (no T.OTC for TINIT to invoke)
-- No terminal attachment occurs → JOBTRM stays zero
-- VER's TTY call puts the job into terminal output wait (Tw) forever
+**Current blocker**: TRMDEF hangs during WYSE.TDV loading.
 
-The job enters Tw at i=5,265,340 (JOBSTS bit 2) and never wakes up.
+The TRMDEF code at `$3E8xxx` successfully loads AM1000.IDV (links
+T.IDV=$89F4) but gets stuck loading WYSE.TDV. The FETCH call enters
+IOWAIT and the scheduler runs, but the disk I/O completion never
+signals the waiting job. The TRMDEF handler never reaches the TDV
+linking code, so:
+- T.TDV stays zero → no terminal display driver
+- TCB+$76 stays zero → no TCRT dispatch table
+- Terminal handler at $001FCA always skips the JOBTRM write
+- JOBTRM = 0 → VER enters Tw wait forever
+
+Root cause: the OS **asynchronous disk I/O chain** is broken. The
+first 207 SCSI reads work because they use the monitor's synchronous
+SCSI driver. TRMDEF's FETCH is the first async I/O through the
+scheduler, and it never completes.
+
+T.INC=0 and T.OTC=0 is **normal** (AM130 source confirms: uses
+built-in TRMICP/TRMOCP when zero). COMINT ($A0F8) is for the AM-350
+intelligent I/O controller, not standard serial ports.
 
 #### Key Hardware Fixes (2026-03-25/26)
 
