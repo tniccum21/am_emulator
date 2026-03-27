@@ -76,13 +76,16 @@ processes AMOSL.INI commands:
 - TCB created at $856E with T.IHW=$FFFE20, T.JLK=$7038
 - Console identification test at $3E878C passes
 
-**Current blocker**: JOBTRM (JCB terminal pointer) is never set. The TCB
-exists and the console is identified, but the bidirectional link
-(JOBTRM↔T.JLK) is never completed. Without JOBTRM, TTY/TOUT calls
-through TRMSER can't find the terminal and output is silently discarded.
+**Current blocker**: The AM1000 interface driver never calls the COMINT
+monitor call to register T.INC (input char routine) and T.OTC (output
+char routine) in the TCB. Without these interrupt-level callbacks:
+- Received ACIA characters are discarded (handler at $88D4 skips on
+  T.INC=0)
+- Output chain can't start (no T.OTC for TINIT to invoke)
+- No terminal attachment occurs → JOBTRM stays zero
+- VER's TTY call puts the job into terminal output wait (Tw) forever
 
-The 66 TTYOUT calls with D6=$503 are trace/command-file output (`:T`
-trace mode), not terminal TTY calls through TRMSER.
+The job enters Tw at i=5,265,340 (JOBSTS bit 2) and never wakes up.
 
 #### Key Hardware Fixes (2026-03-25/26)
 
