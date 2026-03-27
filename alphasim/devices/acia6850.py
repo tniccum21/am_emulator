@@ -205,8 +205,12 @@ class ACIA6850(IODevice):
             # polls TDRE to detect that the line was busy receiving.
             if self._tdre[port] and self._rx_cooldown[port] <= 0:
                 status |= 0x02
-            # Bit 2: DCD -- ~DCD not connected on AM-1200 (floats HIGH, bit=1)
-            status |= 0x04
+            # Bit 2: DCD -- directly-connected terminal: ~DCD tied LOW
+            # (carrier always present).  The AM1000.IDV ISR checks DCD
+            # before TDRE; if DCD=1 (no carrier), the ISR treats the
+            # interrupt as "false" and skips TX processing entirely.
+            # DCD must be 0 for the output chain to work.
+            # status |= 0x04  -- was incorrectly set HIGH
             # Bit 3: CTS -- On AM-1200, ~RTS loops back to ~CTS.
             # MC6850 CTS bit directly reflects /CTS input state:
             #   /CTS LOW → CTS bit = 0 (CTS asserted)
