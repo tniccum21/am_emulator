@@ -80,10 +80,17 @@ The signature `$66FD83EF` doesn't exist ANYWHERE in loaded data.
 WYSE.TDV escape sequences ARE loaded at `$92EA`, but TCB+$4C
 (`$91BC`) points to a parameter block, not the driver entry point.
 
-Possible causes:
-1. TCB field offsets differ between AMOS versions
-2. The .LIT loader doesn't set up the module signature
-3. WYSE.TDV format doesn't include this signature on this version
+Update: `$66FD83EF` = RAD50 "PSEUDO" — the check compares the TDV
+name with PSEUDO. This is informational only (outputs "System not
+available" message) and does NOT block terminal assignment.
+
+The IDV `$0400` flag is a capability bit (not T$DIS). The console
+identification test at `$3E878C` passes (D7 matches `$043C`). But
+no subsequent handler writes JOBTRM through 300 instructions of
+kernel/IDV processing.
+
+The missing JOBTRM write might require a hardware response (ACIA
+echo or status change) that doesn't occur in the emulator.
 
 ## Key Decoded Addresses
 
