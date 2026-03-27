@@ -25,10 +25,11 @@ major progress. Two SCSI bus fixes unblocked the entire OS I/O chain:
 
 ### What doesn't work yet
 
-- **Asynchronous disk I/O**: TRMDEF FETCH for WYSE.TDV enters IOWAIT
-  but the scheduler never delivers I/O completion → job hangs
+- **TDV not loaded**: TRMDEF completes but "WYSE" parsed as buffer
+  param, not TDV filename → T.TDV=0, TCB+$76=0
+- **T.IHW = 0**: ACIA hardware address not set in TCB
 - No terminal output (ACIA TX callback never fires)
-- TRMDEF never completes → TDV never linked → JOBTRM never set
+- JOBTRM never set → Tw wait forever
 
 ### What happens after USP is set
 
@@ -80,22 +81,25 @@ macros from TRMSER. The IDV installs its ISR directly into the CPU
 vector table, not through COMINT. COMINT ($A0F8) is for the AM-350
 intelligent I/O controller, not standard serial ports.
 
-### Actual blocker: TRMDEF stuck in scheduler (2026-03-27)
+### Actual blocker: TDV never linked, T.IHW=0 (2026-03-27)
+
+**Correction**: TRMDEF does NOT hang — it completes. The scheduler
+loop seen earlier was normal async I/O processing. Extended trace to
+8M instructions confirms:
 
 The TRMDEF handler at `$3E8xxx` processes:
 1. TCB clear at `$3E83B2` (i=5221384)
-2. IDV load: BSR `$3E91B4` at `$3E84B0` → loads AM1000.IDV → links
-   T.IDV = `$89F4` at `$3E84EA`
-3. **TDV load attempt**: BSR `$3E91B6` at `$3E84B0` returns to the
-   **scheduler idle loop** at `$001250`. The FETCH for WYSE.TDV
-   triggers a disk I/O that enters IOWAIT. The scheduler spins
-   decrementing D7 from `$0E34` but the I/O never completes.
+2. IDV load at `$3E84B0` → AM1000.IDV loaded → T.IDV = `$89F4`
+3. Buffer params parsed: 3x DSCAN ($A02A) at `$3E851E/8550/857E`
+4. $A01E (SCNR) at `$3E85A0` hits CR → Z=1 → skips TDV load path
+5. T.JLK set to `$7038` at `$3E874C`
+6. IDV INIT call at `$3E8766` → IDV CHROUT via TCRT handler
+7. Many TCRT ($A048) calls from `$3E8F5C` for terminal setup
+8. TRMSER output processing at `$002AFA` writes to output buffer
 
-The TRMDEF code **never reaches the TDV linking code** because the
-job is stuck waiting for the disk I/O to complete. As a result:
-- T.TDV (TCB+$16) stays zero — TDV never linked
-- TCB+$76 stays zero — no TCRT dispatch table
-- The IDV INIT at `$3E8766` (JMP 2(A0) → $89F6) never runs properly
+But the TDV is never loaded because the TRMDEF command text has no
+separate TDV name parameter — "WYSE" was consumed as part of the
+buffer allocation, not as a TDV filename to FETCH.
 
 ### JOBTRM gate mechanism (2026-03-27)
 
@@ -124,23 +128,32 @@ Every call to this handler skips at `$002020` → JOBTRM never set.
 
 ### Root cause chain (updated 2026-03-27)
 
-1. TRMDEF calls FETCH to load WYSE.TDV from DSK0:[1,6]
-2. FETCH triggers disk I/O via IOINI → enters IOWAIT
-3. Scheduler runs but I/O completion never signals → job sleeps forever
-4. TRMDEF never reaches TDV linking code
-5. T.TDV = 0, TCB+$76 = 0 (no TCRT dispatch table)
-6. Terminal handler at $001FCA always skips at $002020
-7. JOBTRM never set → VER enters Tw wait forever
+1. TRMDEF completes but T.TDV = 0 (TDV never loaded)
+2. TCB+$76 = 0 (no TCRT dispatch table)
+3. Terminal handler at `$001FCA` always skips at `$002020`
+4. JOBTRM never set
+5. TTYOUT finds JOBTRM=0 → job enters Tw wait forever
 
-The fundamental issue is the **OS disk I/O chain**: IOINI dispatches
-I/O but the completion path (DD.XFR → driver → IOWAIT wake) never
-fires. This is the same problem as the FIND D6=2 failure — the OS
-I/O subsystem hangs because I/O completions are not delivered.
+The async disk I/O chain DOES work (24 IOINI, 25 IOWAIT, 5 WAKE
+calls during TRMDEF). The first 207 SCSI reads are synchronous but
+the FETCH calls during TRMDEF do complete asynchronously.
 
-Note: The first 207 SCSI reads (ROM boot + disk mount) all work
-because they use synchronous I/O through the monitor's SCSI driver.
-The TRMDEF FETCH is the first attempt at **asynchronous disk I/O**
-through the scheduler, and it fails.
+### Next steps
+
+1. **Why is T.IHW ($FFFE20) not set?** TRMDEF clears TCB, then
+   the `=0:19200` parameter should set T.IHW to ACIA port 0
+   ($FFFE20). Trace the TRMDEF code at `$3E8402-$3E8410` to see
+   how the port hardware address is stored.
+2. **Why is TCB+$76 zero?** It should be set during TDV loading.
+   The TDV name "WYSE" was consumed as a buffer allocation param,
+   not as a TDV filename. Check if the TRMDEF format on AMOS 1.3
+   differs from later versions.
+3. **T.STS = $0000**: No status bits set. T$ASN should be set
+   during TRMDEF to mark the terminal as assigned.
+4. **Is TRMSER's output path working?** The TCRT calls go through
+   the handler at `$001FCA` → IDV → `$002AFA`. Characters ARE
+   placed in the output buffer. But TINIT/T.OTC never fires to
+   write them to the ACIA.
 
 ## Key Decoded Addresses
 
