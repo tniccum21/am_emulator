@@ -29,12 +29,24 @@ major progress. Two SCSI bus fixes unblocked the entire OS I/O chain:
 - No user-mode dispatch confirmed (need to verify stacked SR has S=0)
 - COMINT has not started processing AMOSL.INI commands
 
-### Next Steps
+### What happens after USP is set
 
-1. Verify the scheduler dispatches to user mode (stacked SR at the saved
-   frame should now have S=0 after the USP setup)
-2. Check if COMINT's user code runs and calls FIND for AMOSL.INI
-3. If terminal output appears, the native boot is essentially working
+User mode IS entered. COMINT processes AMOSL.INI:
+- `:T` — trace mode on
+- `JOBS 5` → 8 JOBBLD calls (5 + JOBALC + system)
+- `TRMDEF TRM1,AM1000=0:19200,WYSE,...` → ACIA configured $03/$95/$B5
+  - TRMATT ($A038) called successfully (allocates channel $182E)
+- `VER` → TTYOUT ($A0CA) called 66x with D1='M','O','N',...
+
+But zero TX output because TTYOUT → $A00A → IOGET → DDB queued but
+DDB dispatch at $14FE never runs. Characters go through the I/O chain
+but are never flushed to the ACIA.
+
+### Next step: DDB dispatch
+
+The DDB processing code at `$14FE` walks DDBCHN and dispatches DDBs to
+device drivers (including the terminal/ACIA driver). This code is never
+called. Finding what should trigger it is the key to terminal output.
 
 ## Key Decoded Addresses
 

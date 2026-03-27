@@ -275,6 +275,14 @@ class ACIA6850(IODevice):
             elif (old_cr & 0x03) == 0x03:
                 # Coming out of reset — cancel any pending auto-configure
                 self._auto_config_countdown[port] = 0
+                # Simulate terminal present: on real hardware a connected
+                # terminal drives the RX line, so as soon as the port exits
+                # master reset the ACIA detects a start bit and RDRF asserts.
+                # This models the terminal's idle-line or greeting byte.
+                if port == 0 and not self._rdrf[port]:
+                    self._rx_data[port] = 0x0D  # CR
+                    self._rdrf[port] = True
+                    self._trace(f"Port {port} terminal present (RDRF set)")
                 self._trace(f"Port {port} control = ${value:02X}")
 
             # NOTE: Real MC6850 does NOT flush RX state on RX IRQ enable.
