@@ -59,7 +59,24 @@ The OS now completes its full initialization sequence on the real boot image (`A
 6. Skip path at $003720 (JCB+$18=0) → **$003740: MOVE A6,USP**
 7. USP = $7AC2, JCB+$7C = $7AC2
 
-No terminal output yet. The next frontier is whether the scheduler dispatches the job to user mode and COMINT starts processing AMOSL.INI commands.
+#### What COMINT does after dispatch
+
+The scheduler DOES dispatch to user mode. COMINT runs at $3E8xxx and
+processes AMOSL.INI commands:
+
+- `:T` — trace mode enabled
+- `JOBS 5` → 8 JOBBLD calls (5 jobs + JOBALC + system overhead)
+- `JOBALC TOM,TOM2` → job name allocation
+- `TRMDEF TRM1,AM1000=0:19200,WYSE,...` → ACIA port 0 configured:
+  - $03 (reset) → $95 (RX IRQ, 8N1) → $B5 (TX+RX IRQ)
+  - TRMATT ($A038) called, allocates terminal channel $182E
+- 19 FIND calls, 35 FETCH calls, 66 TTYOUT calls
+
+**Current blocker**: TTYOUT ($A0CA) is called 66 times with real characters
+(e.g. 'M' = $4D) but produces zero ACIA output. The TTYOUT handler path:
+`$A0CA → $A00A → IOGET → DDB queued` — characters enter the DDB/I/O
+chain but the DDB dispatch code at $14FE (which flushes DDBs to device
+drivers including the ACIA) is never called.
 
 #### Key Hardware Fixes (2026-03-25/26)
 
