@@ -237,14 +237,16 @@ class ACIA6850(IODevice):
         if reg_type == "data":
             # Read receive data register
             data = self._rx_data[port]
+            was_rdrf = self._rdrf[port]
             self._rdrf[port] = False
             self._ovrn[port] = False
-            # When the ISR reads the data register while TDRE is set
-            # and no RX data is pending, it's acknowledging a TX IRQ
-            # with nothing to send.  Clear the TX pending latch to
-            # prevent re-entry.  This matches the ISR at $0088CA which
-            # reads the data register as its final action before RTE.
-            if self._tdre[port] and not self._rx_queue[port]:
+            # When the ISR reads the data register while TDRE is set,
+            # no RX data is pending, AND RDRF was NOT set (spurious
+            # read to clear the 6850), clear the TX pending latch.
+            # Do NOT clear on legitimate RX reads (was_rdrf=True) —
+            # the INPR handler reads data to get the received byte,
+            # and clearing TX pending here would kill the output chain.
+            if self._tdre[port] and not self._rx_queue[port] and not was_rdrf:
                 self._tx_irq_pending[port] = False
             # Load next byte from queue if available
             if self._rx_queue[port]:
