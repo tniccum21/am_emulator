@@ -194,12 +194,6 @@ class ACIA6850(IODevice):
             if self._is_master_reset(port):
                 return 0x00
 
-            # Clear TX IRQ latch on status read (edge-triggered model).
-            # The handler at $8844 reads status via MOVE.B (A4),D1.
-            # After reading, the TX IRQ is suppressed until the next
-            # TDRE transition (byte written and shifted out).
-            self._tx_irq_pending[port] = False
-
             status = 0x00
             # Bit 0: RDRF
             if self._rdrf[port]:
@@ -230,9 +224,9 @@ class ACIA6850(IODevice):
             # Bit 5: OVRN
             if self._ovrn[port]:
                 status |= 0x20
-            # Bit 7: IRQ
+            # Bit 7: IRQ — reflects actual interrupt condition
             if ((self._rdrf[port] and self._rx_irq_enabled(port)) or
-                    self._tx_irq_enabled(port)):
+                    (self._tx_irq_enabled(port) and self._tdre[port])):
                 status |= 0x80
             return status
 
@@ -241,6 +235,13 @@ class ACIA6850(IODevice):
             data = self._rx_data[port]
             self._rdrf[port] = False
             self._ovrn[port] = False
+            # When the ISR reads the data register while TDRE is set
+            # and no RX data is pending, it's acknowledging a TX IRQ
+            # with nothing to send.  Clear the TX pending latch to
+            # prevent re-entry.  This matches the ISR at $0088CA which
+            # reads the data register as its final action before RTE.
+            if self._tdre[port] and not self._rx_queue[port]:
+                self._tx_irq_pending[port] = False
             # Load next byte from queue if available
             if self._rx_queue[port]:
                 self._rx_data[port] = self._rx_queue[port].popleft()
@@ -383,13 +384,12 @@ class ACIA6850(IODevice):
         $8844 processes terminal I/O by dispatching pending DDBs to the
         ACIA data register.
 
-        TX IRQ: the 6850 asserts IRQ when TDRE is set and TX IRQ is
-        enabled.  However, TDRE is set by default (data register empty).
-        If TX IRQ is enabled before any data is written, the interrupt
-        fires immediately with nothing to transmit, causing a livelock
-        when the handler doesn't disable the IRQ.  Gate TX IRQ on
-        prior TX activity: only assert after at least one byte has been
-        written to the data register since the last master reset.
+        TX IRQ uses a pending latch set on TDRE 0→1 transitions (after
+        a byte finishes shifting out) and when TX IRQ is newly enabled
+        with TDRE already set.  The latch is cleared when the ISR reads
+        the data register with no output data available ($0088CA).
+        This prevents livelock when TX IRQ is enabled but no data has
+        been queued for output yet.
         """
         for port in range(3):
             if self._is_master_reset(port):
