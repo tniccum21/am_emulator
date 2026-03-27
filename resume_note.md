@@ -64,12 +64,26 @@ The 66 TTYOUT calls with D6=$503 are trace/command-file output
 (`:T` trace mode), not terminal TTY. Real terminal attachment
 happens when COMINT calls EXIT or KBD after INI processing.
 
-### Next step
+### Exact failure point: IDV signature check
 
-Find what condition in the AM1000 IDV probe determines T$ASN.
-The handler at $8844 reads ACIA status $86 (correct) but doesn't
-set T$ASN. The probe might need the ACIA to echo a test byte, or
-some other hardware response that the emulator doesn't provide.
+The AM1000 IDV code at `$008A5E` does:
+```
+CMPI.L #$66FD83EF,-4(A6)   ; A6 = TCB+$4C = $91BC
+BEQ    $008A7E               ; if match → success (set T$ASN)
+                              ; Z=0 → MISMATCH → error path
+```
+
+Value at `$91B8`: `$00000064` (= 100, a buffer size parameter)
+Expected: `$66FD83EF` (driver module signature)
+
+The signature `$66FD83EF` doesn't exist ANYWHERE in loaded data.
+WYSE.TDV escape sequences ARE loaded at `$92EA`, but TCB+$4C
+(`$91BC`) points to a parameter block, not the driver entry point.
+
+Possible causes:
+1. TCB field offsets differ between AMOS versions
+2. The .LIT loader doesn't set up the module signature
+3. WYSE.TDV format doesn't include this signature on this version
 
 ## Key Decoded Addresses
 
