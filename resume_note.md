@@ -138,22 +138,46 @@ The async disk I/O chain DOES work (24 IOINI, 25 IOWAIT, 5 WAKE
 calls during TRMDEF). The first 207 SCSI reads are synchronous but
 the FETCH calls during TRMDEF do complete asynchronously.
 
+### Corrected TCB field layout (AMOS 1.3)
+
+The TCB field offsets on AMOS 1.3 differ from the manual:
+```
+TCB+$00 = $0080  T.STS (status word)
+TCB+$02 = $85FC  AM1000.IDV module pointer (long)
+TCB+$06 = $FFFFFE20  T.IHW (ACIA port 0 hardware address)
+TCB+$0E = $89F4  WYSE.TDV module pointer (long)
+TCB+$40 = $7038  T.JLK (JCB link)
+TCB+$76 = $0000  TCRT dispatch table (never set)
+```
+
+T.IHW IS correctly set to $FFFFFE20. Both IDV and TDV ARE loaded.
+AM1000.IDV is at $85FC, WYSE.TDV is at $89F4. The BSR at $3E84B0
+loads WYSE.TDV (not IDV as first assumed).
+
+### Actual blocker: IOWAIT in terminal output never completes
+
+The TRMSER output handler at $001EC2 calls IOWAIT ($A03E) with
+D6=4, waiting for the ACIA TX to complete. The IOWAIT handler puts
+the job to sleep (removes from run queue, JOBCUR=0). The scheduler
+idles forever because the ACIA TX interrupt never fires to WAKE
+the job.
+
+The output flow:
+1. TCRT ($A048) → $001FCA handler → IDV dispatcher
+2. IDV → TRMSER output at $002AFA → writes char to output buffer
+3. $001EC2: IOWAIT ($A03E) — **job goes to sleep**
+4. Expected: ACIA TX interrupt fires, dequeues char, calls WAKE
+5. Actual: TX interrupt never fires → job never wakes
+
 ### Next steps
 
-1. **Why is T.IHW ($FFFE20) not set?** TRMDEF clears TCB, then
-   the `=0:19200` parameter should set T.IHW to ACIA port 0
-   ($FFFE20). Trace the TRMDEF code at `$3E8402-$3E8410` to see
-   how the port hardware address is stored.
-2. **Why is TCB+$76 zero?** It should be set during TDV loading.
-   The TDV name "WYSE" was consumed as a buffer allocation param,
-   not as a TDV filename. Check if the TRMDEF format on AMOS 1.3
-   differs from later versions.
-3. **T.STS = $0000**: No status bits set. T$ASN should be set
-   during TRMDEF to mark the terminal as assigned.
-4. **Is TRMSER's output path working?** The TCRT calls go through
-   the handler at `$001FCA` → IDV → `$002AFA`. Characters ARE
-   placed in the output buffer. But TINIT/T.OTC never fires to
-   write them to the ACIA.
+1. **Fix ACIA TX interrupt generation**: The ACIA should generate
+   a level-2 interrupt when TDRE=1 and TX IRQ is enabled ($B5
+   control = TX+RX IRQ). The TX IRQ latch may need adjustment.
+2. **Verify the IDV CHROUT path**: The AM1000.IDV CHROUT at $85FC
+   +$02 ($600A → $8608) should enable TX interrupts on the ACIA.
+3. **Check if TINIT is called**: TINIT ($A0FA) should kick off
+   output by triggering the first TX interrupt.
 
 ## Key Decoded Addresses
 

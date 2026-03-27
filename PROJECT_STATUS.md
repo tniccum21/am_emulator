@@ -76,26 +76,20 @@ processes AMOSL.INI commands:
 - TCB created at $856E with T.IHW=$FFFE20, T.JLK=$7038
 - Console identification test at $3E878C passes
 
-**Current blocker**: TRMDEF hangs during WYSE.TDV loading.
+**Current blocker**: ACIA TX interrupt never fires → IOWAIT hangs
 
-The TRMDEF code at `$3E8xxx` successfully loads AM1000.IDV (links
-T.IDV=$89F4) but gets stuck loading WYSE.TDV. The FETCH call enters
-IOWAIT and the scheduler runs, but the disk I/O completion never
-signals the waiting job. The TRMDEF handler never reaches the TDV
-linking code, so:
-- T.TDV stays zero → no terminal display driver
-- TCB+$76 stays zero → no TCRT dispatch table
-- Terminal handler at $001FCA always skips the JOBTRM write
-- JOBTRM = 0 → VER enters Tw wait forever
+TRMDEF completes successfully. Both AM1000.IDV ($85FC) and WYSE.TDV
+($89F4) are loaded and linked. T.IHW=$FFFFFE20 (ACIA port 0). The
+TCRT/TRMSER output path writes characters to the output buffer, then
+calls IOWAIT ($A03E) at $001EC2 to wait for the ACIA TX to flush.
 
-Root cause: the OS **asynchronous disk I/O chain** is broken. The
-first 207 SCSI reads work because they use the monitor's synchronous
-SCSI driver. TRMDEF's FETCH is the first async I/O through the
-scheduler, and it never completes.
+The IOWAIT puts the job to sleep. The ACIA should generate a TX
+interrupt (level 2, vector 26) when TDRE=1 and TX IRQ enabled. The
+TX ISR should dequeue characters and call WAKE. But the TX interrupt
+never fires, so the job sleeps forever and the scheduler idles.
 
-T.INC=0 and T.OTC=0 is **normal** (AM130 source confirms: uses
-built-in TRMICP/TRMOCP when zero). COMINT ($A0F8) is for the AM-350
-intelligent I/O controller, not standard serial ports.
+The ACIA is configured with $B5 (TX+RX IRQ, 8N1, 19200 baud) but
+the emulated TX interrupt generation needs investigation.
 
 #### Key Hardware Fixes (2026-03-25/26)
 
