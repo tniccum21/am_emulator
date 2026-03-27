@@ -122,8 +122,15 @@ From Chapter 16 (Serial Communications System):
 - The AM1000.IDV should call COMINT during init to register its
   routines. It doesn't → T.INC/T.OTC stay zero.
 
+**Definitive finding**: LINE-A `$A0F8` = COMINT (handler at `$6740`).
+LINE-A `$A0FA` = TINIT (handler at `$674E`). Both are implemented
+and in the LINE-A table. But `$A0F8` does NOT appear ANYWHERE in
+loaded memory — no code in the IDV, kernel, TDV, or user space
+ever calls COMINT. The AM1000.IDV simply doesn't register its
+interrupt routines.
+
 Complete failure chain:
-1. IDV doesn't call COMINT → T.INC/T.OTC = 0
+1. IDV doesn't call COMINT ($A0F8) → T.INC/T.OTC = 0
 2. No T.INC → received chars discarded → no terminal attachment
 3. No T.OTC → output chain can't start → no ACIA writes
 4. No attachment → JOBTRM = 0 → TTY enters Tw wait forever
