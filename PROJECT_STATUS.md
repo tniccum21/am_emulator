@@ -29,78 +29,77 @@ Fully functional but cheats: Python intercepts LINE-A system calls and does the 
 printf 'VER\nDIR\nBYE\n' | python3 patch_driver_v7.py 2>/dev/null
 ```
 
-### Native Boot (main.py) — MAJOR PROGRESS
+### Native Boot (main.py) — TERMINAL OUTPUT WORKING
 
-The goal is for the OS to boot and run commands using its own code, with only hardware emulated in Python.
+The OS boots and produces terminal output using its own code with only
+hardware emulated in Python. No LINE-A intercepts, no memory patches,
+no OS structure writes — the CPU executes native AMOS code and the
+ACIA hardware emulation delivers characters to the terminal.
 
-#### What ACTUALLY works (real hardware emulation)
+```bash
+# Run native boot with live terminal output:
+python3 main.py
+```
+
+#### What works natively (2026-03-27)
+
 1. **CPU core**: All 68010 instructions execute correctly
 2. **ROM boot**: Loads AMOS from disk via real SCSI emulation (WD1002 + SCSI bus)
 3. **Hardware devices**: Timer (MC6840 + PIT 8253), LED, DIP switch, ACIA (6850), SASI/SCSI, RTC (MSM5832)
-4. **OS loads and runs**: Scheduler runs, LINE-A dispatch works, timer ISR fires
+4. **OS loads and runs**: Scheduler, LINE-A dispatch, timer ISR, async disk I/O
 5. **SCSI bus interface**: Single-stage selection, COMMAND/DATA/STATUS/MESSAGE phases, DMA with level-5 interrupt completion
-6. **OS disk I/O**: 207 native SCSI reads including AMOSL.INI at LBA 3335
-7. **User-mode context**: JCB+$7C (USP) set to $7AC2, MOVE A6,USP at $003740 executes
-8. **Scheduler dispatch**: WAKE/SCHED bit-13 cycle, timer-driven reschedule, IOGET/TIMSET/IOWAIT chain
+6. **OS disk I/O**: Hundreds of native SCSI reads including AMOSL.INI
+7. **AMOSL.INI processing**: :T, JOBS 5, JOBALC, TRMDEF (two terminals)
+8. **Terminal drivers loaded**: AM1000.IDV (serial port) + WYSE.TDV (display) from disk
+9. **ACIA interrupt-driven output**: TX interrupts dequeue characters from TRMSER output buffer, write to ACIA data register, trigger next interrupt
+10. **Terminal output**: AMOS boot banner, license agreement, WYSE escape sequences — 2322+ bytes of real terminal data
 
-#### Current Native Frontier
+#### Native boot output
 
-The OS now completes its full initialization sequence on the real boot image (`AMOS_1-3_Boot_OS.img`):
+The OS displays the Alpha Microsystems logo (block graphics via WYSE
+escape sequences), the "System not available" diagnostic, and the
+full AMOS software license agreement. It then continues processing
+AMOSL.INI (second TRMDEF for port 2).
 
-1. ROM boot loads monitor from disk (78 SASI reads, LBA 0-3326)
-2. Monitor creates JCB at $7038, clears memory, sets up job fields
-3. RTC initialization via LINE-A $A07A
-4. **Disk mount via LINE-A $A0AA** — reads 207 blocks via SCSI bus including:
-   - TEST UNIT READY → GOOD
-   - READ(10) LBA=1 (disk label)
-   - MFD reads (LBA 79, 340, 634, 868, 1227)
-   - **AMOSL.INI at LBA 3335** ← first native read of the INI file!
-5. $A0AA returns → code reaches $0036F4
-6. Skip path at $003720 (JCB+$18=0) → **$003740: MOVE A6,USP**
-7. USP = $7AC2, JCB+$7C = $7AC2
+#### ACIA fixes that enabled terminal output (2026-03-27)
 
-#### What COMINT does after dispatch
+Three fixes to the MC6850 ACIA emulation unblocked the entire terminal
+output chain:
 
-The scheduler DOES dispatch to user mode. COMINT runs at $3E8xxx and
-processes AMOSL.INI commands:
+1. **DCD=0 (carrier present)**: The AM1000.IDV ISR (from source
+   `am1000.m68`) checks DCD before TDRE in GINTRP. With DCD=1 (the
+   previous default), the ISR treated every TX interrupt as a "false
+   interrupt" and skipped output processing entirely. On a real
+   AM-1000 with directly-connected terminals, ~DCD is tied LOW
+   (carrier always present), so DCD bit = 0 is correct.
 
-- `:T` — trace mode enabled
-- `JOBS 5` → 8 JOBBLD calls (5 jobs + JOBALC + system overhead)
-- `JOBALC TOM,TOM2` → job name allocation
-- `TRMDEF TRM1,AM1000=0:19200,WYSE,...` → ACIA port 0 configured:
-  - $03 (reset) → $95 (RX IRQ, 8N1) → $B5 (TX+RX IRQ)
-  - TRMATT ($A038) called, allocates terminal channel $182E
-- 19 FIND calls, 35 FETCH calls, 66 TTYOUT calls
-- AM1000.IDV loaded from DSK0:[1,6] (LBA 1275)
-- WYSE.TDV loaded from DSK0:[1,6] (LBA 3329)
-- TCB created at $856E with T.IHW=$FFFE20, T.JLK=$7038
-- Console identification test at $3E878C passes
+2. **TX IRQ latch preserved during RX reads**: The INPR handler reads
+   the ACIA data register to get received characters. This read must
+   NOT clear the TX IRQ pending latch, or the output chain dies after
+   processing echo bytes. The latch is only cleared on "dismiss"
+   reads (RDRF was not set — the INFI handler at $0088CA).
 
-**Current blocker**: ACIA TX interrupt never fires → IOWAIT hangs
+3. **Remove RX cooldown TDRE suppression**: A timing mechanism
+   designed for terminal-detect echo suppressed TDRE in the status
+   register after receiving echo bytes. This caused the ISR to see
+   status=$80 (no TDRE), fall through to INFI, and kill the TX chain.
+   TDRE must always reflect the true transmit-ready state.
 
-TRMDEF completes successfully. Both AM1000.IDV ($85FC) and WYSE.TDV
-($89F4) are loaded and linked. T.IHW=$FFFFFE20 (ACIA port 0). The
-TCRT/TRMSER output path writes characters to the output buffer, then
-calls IOWAIT ($A03E) at $001EC2 to wait for the ACIA TX to flush.
+#### Earlier key fixes
 
-The IOWAIT puts the job to sleep. The ACIA should generate a TX
-interrupt (level 2, vector 26) when TDRE=1 and TX IRQ enabled. The
-TX ISR should dequeue characters and call WAKE. But the TX interrupt
-never fires, so the job sleeps forever and the scheduler idles.
+1. **SCSI bus selection**: Single-stage handshake (monitor sends $00/$01/$11 once)
+2. **SCSI DMA interrupt level**: Level 5 (monitor's ISR at $006C18, not ROM stub)
+3. **Vector-8 frame layout**: Normal [SR][PC] for privilege violations
+4. **ACIA interrupt level**: Level 2, autovectored (vector 26)
+5. **Exception frame for vector 26**: Normal [SR][PC] (not reversed)
 
-The ACIA is configured with $B5 (TX+RX IRQ, 8N1, 19200 baud) but
-the emulated TX interrupt generation needs investigation.
+#### Current frontier
 
-#### Key Hardware Fixes (2026-03-25/26)
-
-1. **Vector-8 frame layout**: Restored normal 68000 [SR][PC] for privilege violations (was incorrectly reversed for vectors 8/9)
-2. **RTE supervisor preservation**: Extended to helpers at $003DDA/$003DE2
-3. **SCSI bus selection**: Changed from two-stage to single-stage handshake — the 68010 monitor sends $00/$01/$11 once and expects COMMAND phase immediately
-4. **SCSI DMA interrupt level**: Changed from level 2 (ROM stub at $B9C) to level 5 (monitor's completion ISR at $006C18)
-
-These two SCSI fixes unblocked the entire native I/O chain:
-- Before: zero OS-level SCSI reads after ROM boot
-- After: 207 OS-level SCSI reads, AMOSL.INI loaded, user context initialized
+- Terminal output works through the AMOS boot banner and license text
+- Processing AMOSL.INI: reaches second TRMDEF (TRM2, port 2)
+- Next: VER, PARITY, DEVTBL, BITMAP, SYSTEM commands
+- No interactive input yet (RDRF injection untested with new ACIA)
+- Need more instructions (>50M) to complete full INI processing
 
 ## Test Baseline
 
