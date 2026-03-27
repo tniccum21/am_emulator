@@ -199,11 +199,7 @@ class ACIA6850(IODevice):
             if self._rdrf[port]:
                 status |= 0x01
             # Bit 1: TDRE
-            # TDRE is suppressed during RX cooldown: after receiving a byte,
-            # the stop-bit phase briefly occupies the line.  This models
-            # the half-duplex terminal detect turnaround where the OS
-            # polls TDRE to detect that the line was busy receiving.
-            if self._tdre[port] and self._rx_cooldown[port] <= 0:
+            if self._tdre[port]:
                 status |= 0x02
             # Bit 2: DCD -- directly-connected terminal: ~DCD tied LOW
             # (carrier always present).  The AM1000.IDV ISR checks DCD
