@@ -246,11 +246,16 @@ class SCSIBusInterface(IODevice):
             phase_val = int(self._phase)
 
         # Bit 0 = data-ready signal (NOT part of phase encoding).
-        # The driver compares the masked status against exact phase
-        # values ($06=DATA_OUT, $0E=DATA_IN, $16=COMMAND, $1E=STATUS).
-        # Bit 0 must ONLY be set during DATA_IN for the DMA byte-ready
-        # indicator.  All other phases need exact phase match.
-        if self._req and self._phase == SCSIPhase.DATA_IN:
+        # The driver uses bit 0 in two ways:
+        #   1. Phase detection: masks with $1F and compares against exact
+        #      phase values ($06=DATA_OUT, $16=COMMAND).  Bit 0 must be
+        #      CLEAR during these phases.
+        #   2. Ready polling: masks with $01 and loops until set before
+        #      reading STATUS/MESSAGE bytes ($006C42).  Bit 0 must be
+        #      SET during DATA_IN, STATUS, and MESSAGE_IN.
+        if self._req and self._phase not in (
+            SCSIPhase.COMMAND, SCSIPhase.DATA_OUT, SCSIPhase.BUS_FREE,
+        ):
             phase_val |= 0x01
 
         return phase_val
