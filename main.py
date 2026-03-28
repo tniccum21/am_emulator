@@ -37,6 +37,11 @@ def main():
         if hasattr(dev, '_read_count'):
             dev._read_count = 999
 
+    # Disable ACIA TX→RX echo. The echo mechanism exists for ROM
+    # terminal-detect, but once the OS is running TRMSER handles
+    # echo via software. Hardware echo causes double characters.
+    acia._echo_enabled = [False, False, False]
+
     # Wire TX output to stdout
     tx_count = 0
     in_esc = False
