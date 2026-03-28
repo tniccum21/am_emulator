@@ -1,12 +1,17 @@
-#\!/usr/bin/env python3
+#!/usr/bin/env python3
 """Native boot runner with live terminal output.
 
 Boots AMOS from the real disk image and displays terminal output
-in real time. WYSE escape sequences are stripped for readability
-on modern terminals.
+in real time. Supports interactive keyboard input.
+
+WYSE escape sequences are stripped for readability on modern terminals.
 """
-import sys
+import fcntl
 import os
+import select
+import sys
+import termios
+import tty
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tests.integration.boot_helpers import build_native_boot_system, find_boot_image
@@ -18,7 +23,12 @@ def main():
         print("No boot image found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Booting from {img.name}...", file=sys.stderr)
+    interactive = sys.stdin.isatty()
+    if interactive:
+        print(f"Booting from {img.name}... (Ctrl-C to quit)", file=sys.stderr)
+    else:
+        print(f"Booting from {img.name}...", file=sys.stderr)
+
     cpu, bus, led, acia, sasi = build_native_boot_system(img)
 
     # Suppress LED and SCSI debug output
@@ -29,7 +39,7 @@ def main():
 
     # Wire TX output to stdout
     tx_count = 0
-    in_esc = False  # track WYSE escape sequences
+    in_esc = False
 
     def tx_cb(port, value):
         nonlocal tx_count, in_esc
@@ -38,36 +48,41 @@ def main():
         tx_count += 1
         ch = value & 0x7F
 
-        # Simple WYSE escape filter: ESC starts a sequence,
-        # ended by an alpha character or certain controls.
+        # Simple WYSE escape filter
         if ch == 0x1B:
             in_esc = True
             return
         if in_esc:
-            # Most WYSE sequences are ESC + one-or-two chars
-            # Pass through cursor positioning and common ones
             if chr(ch).isalpha() or ch in (0x02, 0x03, 0x07):
                 in_esc = False
             return
-
         if ch == 0x00:
-            return  # skip nulls
+            return
 
-        b = bytes([ch])
-        sys.stdout.buffer.write(b)
+        sys.stdout.buffer.write(bytes([ch]))
         sys.stdout.buffer.flush()
 
     acia.tx_callback = tx_cb
 
-    # Feed stdin to RX if available
+    # Set up input handling
     input_data = b""
-    if not sys.stdin.isatty():
+    old_settings = None
+
+    if interactive:
+        # Put terminal in raw mode for character-at-a-time input
+        old_settings = termios.tcgetattr(sys.stdin)
+        tty.setraw(sys.stdin.fileno())
+        # Make stdin non-blocking
+        flags = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    else:
         input_data = sys.stdin.buffer.read()
 
     cpu.reset()
 
-    max_instructions = 100_000_000
-    feed_at = 5_500_000  # feed input after TRMDEF completes
+    max_instructions = 500_000_000
+    feed_at = 5_500_000
+    check_input_interval = 5000  # check for keyboard input every N instructions
 
     try:
         for i in range(1, max_instructions + 1):
@@ -75,18 +90,31 @@ def main():
             bus.tick(cycles)
 
             # Feed piped input after terminal is set up
-            if i == feed_at and input_data:
+            if not interactive and i == feed_at and input_data:
                 acia.send_to_port(0, input_data)
-                print(
-                    f"\n[fed {len(input_data)} bytes to port 0]",
-                    file=sys.stderr,
-                )
+
+            # Poll for interactive keyboard input
+            if interactive and i % check_input_interval == 0:
+                try:
+                    data = sys.stdin.buffer.read(64)
+                    if data:
+                        # Map CR to CR (AMOS expects CR)
+                        for b in data:
+                            if b == 3:  # Ctrl-C
+                                raise KeyboardInterrupt
+                            byte = b & 0x7F
+                            acia.send_to_port(0, bytes([byte]))
+                except (BlockingIOError, IOError):
+                    pass
 
             if cpu.halted:
                 print(f"\nCPU halted at i={i}", file=sys.stderr)
                 break
     except KeyboardInterrupt:
         pass
+    finally:
+        if old_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     print(f"\n--- {i} instructions, {tx_count} TX bytes ---", file=sys.stderr)
 
