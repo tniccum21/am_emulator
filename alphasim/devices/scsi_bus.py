@@ -247,9 +247,12 @@ class SCSIBusInterface(IODevice):
 
         # Bit 0 = data-ready signal (NOT part of phase encoding).
         # Set during target-to-initiator phases when data is available.
-        # Must be CLEAR during COMMAND phase so driver's phase detection
-        # (CMP.B #$16) matches exactly.
-        if self._req and self._phase != SCSIPhase.COMMAND:
+        # Must be CLEAR during COMMAND and DATA_OUT phases so the
+        # driver's phase detection (CMP.B #$06 for DATA_OUT, CMP.B
+        # #$16 for COMMAND) matches exactly.
+        if self._req and self._phase in (
+            SCSIPhase.DATA_IN, SCSIPhase.STATUS, SCSIPhase.MESSAGE_IN,
+        ):
             phase_val |= 0x01
 
         return phase_val
