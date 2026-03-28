@@ -25,7 +25,7 @@ def main():
 
     interactive = sys.stdin.isatty()
     if interactive:
-        print(f"Booting from {img.name}... (Ctrl-C to quit)", file=sys.stderr)
+        print(f"Booting from {img.name}... (Ctrl-C twice to quit)", file=sys.stderr)
     else:
         print(f"Booting from {img.name}...", file=sys.stderr)
 
@@ -88,6 +88,7 @@ def main():
     max_instructions = 500_000_000
     feed_at = 5_500_000
     check_input_interval = 5000  # check for keyboard input every N instructions
+    last_ctrlc = 0  # instruction count of last Ctrl-C
 
     try:
         for i in range(1, max_instructions + 1):
@@ -103,10 +104,15 @@ def main():
                 try:
                     data = sys.stdin.buffer.read(64)
                     if data:
-                        # Map CR to CR (AMOS expects CR)
                         for b in data:
                             if b == 3:  # Ctrl-C
-                                raise KeyboardInterrupt
+                                # Double Ctrl-C (within 500K instructions) = exit
+                                if i - last_ctrlc < 500_000:
+                                    raise KeyboardInterrupt
+                                last_ctrlc = i
+                                # Single Ctrl-C → send to AMOS
+                                acia.send_to_port(0, b"\x03")
+                                continue
                             byte = b & 0x7F
                             acia.send_to_port(0, bytes([byte]))
                 except (BlockingIOError, IOError):
