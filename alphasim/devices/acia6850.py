@@ -379,23 +379,31 @@ class ACIA6850(IODevice):
                 self._echo_pending[i] = new_pending
 
     def get_interrupt_level(self) -> int:
-        """ACIA generates level-2 interrupts on the AM-1200.
+        """ACIA generates interrupts on the AM-1200.
 
-        The loaded monitor's TRMDEF command installs its ACIA handler at
-        vector 26 (autovectored level 2, address $0068).  The handler at
-        $8844 processes terminal I/O by dispatching pending DDBs to the
-        ACIA data register.
+        Port 0 uses level 2 (autovector 26, address $068).
+        Ports 1 and 2 use level 3 (autovector 27, address $06C).
+        The AM1000.IDV installs separate ISR entry points:
+          INTR0 at $068 for port 0
+          INTR1 at $06C for ports 1 and 2
 
         TX IRQ uses a pending latch set on TDRE 0→1 transitions (after
         a byte finishes shifting out) and when TX IRQ is newly enabled
         with TDRE already set.  The latch is cleared when the ISR reads
         the data register with no output data available ($0088CA).
-        This prevents livelock when TX IRQ is enabled but no data has
-        been queued for output yet.
         """
-        for port in range(3):
+        # Return highest active interrupt level.
+        # Level 3 (ports 1/2) has priority over level 2 (port 0).
+        for port in (1, 2):
             if self._is_master_reset(port):
                 continue
+            if self._rdrf[port] and self._rx_irq_enabled(port):
+                return 3
+            if (self._tx_irq_enabled(port) and self._tdre[port]
+                    and self._tx_irq_pending[port]):
+                return 3
+        port = 0
+        if not self._is_master_reset(port):
             if self._rdrf[port] and self._rx_irq_enabled(port):
                 return 2
             if (self._tx_irq_enabled(port) and self._tdre[port]
