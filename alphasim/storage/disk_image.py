@@ -15,9 +15,11 @@ class DiskImage:
 
     SECTOR_SIZE = 512
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, writable: bool = False) -> None:
         self._path = Path(path)
-        self._file = open(self._path, "rb")
+        mode = "r+b" if writable and self._path.exists() else "rb"
+        self._file = open(self._path, mode)
+        self._writable = "+" in mode
         self._file.seek(0, 2)  # seek to end
         self._size = self._file.tell()
         self._sector_count = self._size // self.SECTOR_SIZE
@@ -35,6 +37,16 @@ class DiskImage:
             return None
         self._file.seek(lba * self.SECTOR_SIZE)
         return self._file.read(count * self.SECTOR_SIZE)
+
+    def write_sectors(self, lba: int, data: bytes | bytearray) -> bool:
+        """Write sector data at LBA. Returns False if out of range or read-only."""
+        count = len(data) // self.SECTOR_SIZE
+        if not self._writable or lba < 0 or lba + count > self._sector_count:
+            return False
+        self._file.seek(lba * self.SECTOR_SIZE)
+        self._file.write(data)
+        self._file.flush()
+        return True
 
     @property
     def sector_count(self) -> int:

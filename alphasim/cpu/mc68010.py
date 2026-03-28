@@ -29,8 +29,17 @@ CCR_MASK = 0x001F
 class MC68010:
     """Motorola MC68010 CPU emulation core."""
 
-    def __init__(self, bus: MemoryBus) -> None:
+    _VALID_CPU_MODELS = {"68010", "68020", "68030", "68040"}
+
+    def __init__(self, bus: MemoryBus, cpu_model: str = "68010") -> None:
         self.bus = bus
+        normalized_model = cpu_model.upper()
+        if normalized_model not in self._VALID_CPU_MODELS:
+            raise ValueError(
+                f"Unsupported CPU model {cpu_model!r}; expected one of "
+                f"{sorted(self._VALID_CPU_MODELS)}"
+            )
+        self.cpu_model = normalized_model
 
         # Data registers D0-D7
         self.d: list[int] = [0] * 8
@@ -50,6 +59,7 @@ class MC68010:
 
         # 68010 additions
         self.vbr: int = 0  # Vector base register
+        self.cacr: int = 0  # Minimal cache-control register model for CPU probes
 
         # CPU state
         self.stopped: bool = False
@@ -62,8 +72,55 @@ class MC68010:
         # Trace callback (set by debug module)
         self.trace_hook = None
 
-        # Debug flag: use 68000-style 6-byte exception frames instead of 68010 8-byte
-        self.use_68000_frames: bool = False
+        # Use 68000-style exception frames.  The AM-1200 ROM exception
+        # handlers (bus error at $F916/$0AFA, etc.) use hard-coded stack
+        # offsets that assume 68000 frame layout.  With 68010 format $0
+        # or format $8 frames the handlers read SR/PC from wrong offsets
+        # and crash.  Setting this True makes all exceptions push 68000-
+        # style frames (6-byte normal, 14-byte bus error) and RTE pop
+        # only SR+PC (6 bytes).
+        self.use_68000_frames: bool = True
+
+    def supports_control_register(self, control_register: int) -> bool:
+        """Return whether MOVEC may access the given control register."""
+        return control_register in {0x000, 0x001, 0x800, 0x801} or (
+            control_register == 0x002 and self.cpu_model != "68010"
+        )
+
+    def read_control_register(self, control_register: int) -> int:
+        """Read a supported control register."""
+        if control_register == 0x000:  # SFC
+            return 0
+        if control_register == 0x001:  # DFC
+            return 0
+        if control_register == 0x002:  # CACR
+            return self.cacr
+        if control_register == 0x800:  # USP
+            return self.usp
+        if control_register == 0x801:  # VBR
+            return self.vbr
+        raise ValueError(f"Unsupported control register ${control_register:03X}")
+
+    def write_control_register(self, control_register: int, value: int) -> None:
+        """Write a supported control register."""
+        if control_register == 0x002:  # CACR
+            # Minimal model: preserve only the bits the AMOS selector probes.
+            if self.cpu_model == "68020":
+                self.cacr = value & 0x00000200
+            elif self.cpu_model in {"68030", "68040"}:
+                self.cacr = value & 0x80000200
+            else:
+                self.cacr = 0
+            return
+        if control_register == 0x800:  # USP
+            self.usp = value & 0xFFFFFFFF
+            return
+        if control_register == 0x801:  # VBR
+            self.vbr = value & 0xFFFFFFFF
+            return
+        if control_register in {0x000, 0x001}:  # SFC/DFC
+            return
+        raise ValueError(f"Unsupported control register ${control_register:03X}")
 
     # ── Status register helpers ──────────────────────────────────────
 
@@ -229,6 +286,7 @@ class MC68010:
         self.stopped = False
         self.halted = False
         self.vbr = 0
+        self.cacr = 0
 
         # Activate phantom ROM overlay for vector reads
         self.bus.activate_phantom()
@@ -304,21 +362,40 @@ class MC68010:
         if self.trace_hook:
             self.trace_hook(self)
 
-        # Fetch opcode word
-        opword = self.fetch_word()
+        # Save instruction PC before fetch (needed for bus error frame)
+        instruction_pc = self.pc
 
-        # Dispatch
-        if self.opcode_table:
-            handler = self.opcode_table[opword]
-            if handler is not None:
-                cost = handler(self, opword)
-                self.cycles += cost
-                return cost
+        # Fetch and execute — catch bus errors from any memory access
+        from ..bus.memory_bus import BusError
+        try:
+            # Fetch opcode word
+            opword = self.fetch_word()
 
-        # Unimplemented opcode — trigger illegal instruction exception
-        self.pc = (self.pc - 2) & 0xFFFFFF  # back up PC to point at bad opcode
-        from .exceptions import execute_exception
-        execute_exception(self, 4)  # vector 4 = illegal instruction
-        cost = 34
-        self.cycles += cost
-        return cost
+            # Dispatch
+            if self.opcode_table:
+                handler = self.opcode_table[opword]
+                if handler is not None:
+                    cost = handler(self, opword)
+                    self.cycles += cost
+                    return cost
+
+            # Unimplemented opcode — trigger illegal instruction exception
+            self.pc = (self.pc - 2) & 0xFFFFFF  # back up PC to point at bad opcode
+            from .exceptions import execute_exception
+            execute_exception(self, 4)  # vector 4 = illegal instruction
+            cost = 34
+            self.cycles += cost
+            return cost
+
+        except BusError as e:
+            from .exceptions import execute_bus_error
+            # Use current PC (past fetched words), not instruction_pc.
+            # The AM-1200 ROM/OS bus error handlers were written for 68000
+            # where bus error does NOT restart the faulted instruction —
+            # the stacked PC points past the instruction.  Using the
+            # already-advanced PC matches that expectation and prevents
+            # infinite restart loops (e.g. ROM checksum scan past ROM end).
+            execute_bus_error(self, e.address, e.is_write, self.pc)
+            cost = 126  # approximate bus error exception processing cycles
+            self.cycles += cost
+            return cost

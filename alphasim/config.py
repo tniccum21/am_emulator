@@ -21,9 +21,18 @@ class SystemConfig:
     # Disk image
     disk_image_path: Path | None = None
 
+    # Boot behavior
+    # native: hardware-first path, no Python trap/I/O/file bypasses
+    # compat: legacy path with Python-side boot assistance still enabled
+    boot_mode: str = "native"
+    boot_monitor_override: str | None = None
+    cpu_model: str = "68010"
+
     # Debug options
     trace_enabled: bool = False
     trace_file: str | None = None
+    native_find_trace: bool = False
+    native_dispatch_trace: bool = False
     breakpoints: list[int] = field(default_factory=list)
     max_instructions: int = 0  # 0 = unlimited
 

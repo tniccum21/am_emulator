@@ -22,6 +22,10 @@ class SCSITarget:
         """Read sectors from disk. Returns None on error."""
         return self._disk.read_sectors(lba, count)
 
+    def write_sectors(self, lba: int, data: bytes | bytearray) -> bool:
+        """Write sectors to disk. Returns True on success."""
+        return self._disk.write_sectors(lba, data)
+
     @property
     def sector_count(self) -> int:
         return self._disk.sector_count

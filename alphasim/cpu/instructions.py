@@ -1341,7 +1341,7 @@ def op_trap(cpu: MC68010, opword: int) -> int:
 def op_rte(cpu: MC68010, opword: int) -> int:
     """RTE — return from exception."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)  # privilege violation
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     return execute_rte(cpu)
 
@@ -1349,7 +1349,7 @@ def op_rte(cpu: MC68010, opword: int) -> int:
 def op_stop(cpu: MC68010, opword: int) -> int:
     """STOP #imm — load SR and stop."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(imm)
@@ -1365,7 +1365,7 @@ def op_nop(cpu: MC68010, opword: int) -> int:
 def op_reset_instr(cpu: MC68010, opword: int) -> int:
     """RESET instruction — assert reset line (supervisor only)."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     # Just a no-op in emulation — real hardware resets peripherals
     return 132
@@ -1378,7 +1378,7 @@ def op_reset_instr(cpu: MC68010, opword: int) -> int:
 def op_move_to_sr(cpu: MC68010, opword: int) -> int:
     """MOVE <ea>,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ea_mode = (opword >> 3) & 0x7
     ea_reg = opword & 0x7
@@ -1391,7 +1391,7 @@ def op_move_to_sr(cpu: MC68010, opword: int) -> int:
 def op_move_from_sr(cpu: MC68010, opword: int) -> int:
     """MOVE SR,<ea> — privileged on 68010."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ea_mode = (opword >> 3) & 0x7
     ea_reg = opword & 0x7
@@ -1413,7 +1413,7 @@ def op_move_to_ccr(cpu: MC68010, opword: int) -> int:
 def op_andi_sr(cpu: MC68010, opword: int) -> int:
     """ANDI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr & imm)
@@ -1423,7 +1423,7 @@ def op_andi_sr(cpu: MC68010, opword: int) -> int:
 def op_ori_sr(cpu: MC68010, opword: int) -> int:
     """ORI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr | imm)
@@ -1433,7 +1433,7 @@ def op_ori_sr(cpu: MC68010, opword: int) -> int:
 def op_eori_sr(cpu: MC68010, opword: int) -> int:
     """EORI #imm,SR — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     imm = cpu.fetch_word()
     cpu.set_sr(cpu.sr ^ imm)
@@ -1615,7 +1615,7 @@ def op_exg(cpu: MC68010, opword: int) -> int:
 def op_move_usp(cpu: MC68010, opword: int) -> int:
     """MOVE USP,An or MOVE An,USP — privileged."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     reg = opword & 0x7
     direction = (opword >> 3) & 0x1
@@ -1635,7 +1635,7 @@ def op_move_usp(cpu: MC68010, opword: int) -> int:
 def op_movec(cpu: MC68010, opword: int) -> int:
     """MOVEC — move control register (68010+)."""
     if not cpu.supervisor:
-        execute_exception(cpu, 8)
+        execute_exception(cpu, 8, pc_override=(cpu.pc - 2) & 0xFFFFFF)
         return 34
     ext = cpu.fetch_word()
     reg_num = (ext >> 12) & 0xF
@@ -1650,18 +1650,16 @@ def op_movec(cpu: MC68010, opword: int) -> int:
         is_addr = True
         rn = reg_num - 8
 
+    if not cpu.supports_control_register(cr):
+        # Unsupported control registers (for example CACR on a 68010) must
+        # trap as illegal instructions so ROM CPU-detection probes can follow
+        # their exception-driven fallback path.
+        execute_exception(cpu, 4)
+        return 34
+
     if direction == 0:
         # Control register → general register
-        if cr == 0x800:  # USP
-            val = cpu.usp
-        elif cr == 0x801:  # VBR
-            val = cpu.vbr
-        elif cr == 0x000:  # SFC
-            val = 0
-        elif cr == 0x001:  # DFC
-            val = 0
-        else:
-            val = 0
+        val = cpu.read_control_register(cr)
         if is_addr:
             cpu.a[rn] = val & 0xFFFFFFFF
         else:
@@ -1672,10 +1670,7 @@ def op_movec(cpu: MC68010, opword: int) -> int:
             val = cpu.a[rn]
         else:
             val = cpu.d[rn]
-        if cr == 0x800:  # USP
-            cpu.usp = val & 0xFFFFFFFF
-        elif cr == 0x801:  # VBR
-            cpu.vbr = val & 0xFFFFFFFF
+        cpu.write_control_register(cr, val)
 
     return 12
 
@@ -1692,7 +1687,17 @@ def op_line_a(cpu: MC68010, opword: int) -> int:
 
 
 def op_line_f(cpu: MC68010, opword: int) -> int:
-    """Line-F emulator trap (vector 11)."""
+    """Line-F emulator trap (vector 11).
+
+    68040 cache instructions (CPUSHA, CINVA, etc.) appear as LINE-F
+    on 68010.  The AMOS .MON is compiled for 68040 and uses these
+    for cache management.  Treat them as NOPs since 68010 has no
+    data cache — avoids triggering the OS LINE-F exception handler
+    which doesn't handle cache opcodes correctly.
+    """
+    # 68040 cache instructions: $F4xx range (CPUSHA, CINVA, CPUSHP, etc.)
+    if (opword & 0xFF00) == 0xF400:
+        return 4  # NOP — no cache to flush/invalidate
     cpu.pc = (cpu.pc - 2) & 0xFFFFFF
     execute_exception(cpu, 11)
     return 34

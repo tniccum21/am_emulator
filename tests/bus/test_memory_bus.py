@@ -43,8 +43,13 @@ class TestByteSwap:
         assert self.bus.read_long(0x100) == 0xDEADBEEF
 
     def test_byte_within_word(self):
-        """Writing individual bytes, then reading as word."""
-        # Store physical bytes: phys[$200]=0x01, phys[$201]=0x02
+        """Writing individual bytes, then reading as word.
+
+        AM-1200 byte writes go to physical address directly (no swap).
+        Word read applies swap: (phys[addr+1] << 8) | phys[addr].
+        So phys[0x200]=0x01 (low byte), phys[0x201]=0x02 (high byte),
+        word = (0x02 << 8) | 0x01 = 0x0201.
+        """
         self.bus.write_byte(0x200, 0x01)
         self.bus.write_byte(0x201, 0x02)
         # Word read: (phys[$201] << 8) | phys[$200] = $0201

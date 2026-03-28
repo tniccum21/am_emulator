@@ -7,9 +7,9 @@ CPU, translating register commands to disk operations on the backend.
 Register map (byte-accessible at $FFFFE0-$FFFFE7):
     $FFFFE0 (reg 0): Status (R) / Command (W)
     $FFFFE1 (reg 1): Error (R) / Write precomp (W)
-    $FFFFE2 (reg 2): Sector count/number
-    $FFFFE3 (reg 3): Sector number / track low
-    $FFFFE4 (reg 4): Cylinder low / PIO data port
+    $FFFFE2 (reg 2): Sector number
+    $FFFFE3 (reg 3): Cylinder low
+    $FFFFE4 (reg 4): PIO data port
     $FFFFE5 (reg 5): Cylinder high
     $FFFFE6 (reg 6): SDH — drive/head select; bit 1 = controller ready (R)
     $FFFFE7 (reg 7): Status (R) / Command (W)
@@ -27,7 +27,7 @@ Command codes written to reg 7:
 The boot ROM's SCINI code (Domain D) uses this controller as follows:
 1. Write SDH for target selection, write $0C to reg 0 → target responds
 2. Recalibrate via $58/$0C commands to reg 0
-3. Set CHS in regs 2/3/6, write $18 to reg 0 → read sector
+3. Set CHS in regs 2/3/5/6, write $18 to reg 0 → read sector
 4. Write $81 to reg 7 → data transfer, $84 to reg 0 → PIO start
 5. Read 513 bytes from reg 4 (PIO data port)
 """
@@ -50,11 +50,16 @@ class SASIController(IODevice):
     def __init__(self, debug: bool = False) -> None:
         self._debug = debug
 
-        # WD1002 registers
-        self._sct = 0x00          # Reg 2: sector count/number
-        self._sno = 0x00          # Reg 3: sector number / track low
-        self._cyh = 0x00          # Reg 5: cylinder high
-        self._sdh = 0x00          # Reg 6: SDH (drive/head select)
+        # WD1002 register latches used by the ROM boot path.
+        self._sector_number = 0x00
+        self._cylinder_low = 0x00
+        self._cylinder_high = 0x00
+        self._sdh = 0x00
+
+        # Legacy aliases used by older diagnostics in this repo.
+        self._sct = 0x00
+        self._sno = 0x00
+        self._cyh = 0x00
 
         # Controller state
         self._ready = False       # SDH bit 1: controller ready
@@ -117,10 +122,13 @@ class SASIController(IODevice):
         elif reg == 1:
             self._err_reg = value
         elif reg == 2:
+            self._sector_number = value
             self._sct = value
         elif reg == 3:
+            self._cylinder_low = value
             self._sno = value
         elif reg == 5:
+            self._cylinder_high = value
             self._cyh = value
         elif reg == 6:
             self._sdh = value
@@ -141,11 +149,20 @@ class SASIController(IODevice):
 
     # ── Command handling ──────────────────────────────────────────
 
+    def acknowledge_interrupt(self, level: int) -> None:
+        """IACK — clear the pending interrupt."""
+        self._irq_pending = False
+
     def _exec_dat_command(self, cmd: int) -> None:
         """Handle command byte written to reg 0 (DAT)."""
+        self._irq_pending = False  # New command cancels stale interrupt
         if cmd == 0x18:
             # READ SECTOR — compute LBA from CHS registers, read data
             self._do_read_sector()
+            self._irq_pending = True  # Signal command completion
+        elif cmd == 0x0C or cmd == 0x58:
+            # RESTORE / RECALIBRATE — seek complete
+            self._irq_pending = True
         elif cmd == 0x84:
             # PIO START — reset data index for byte transfer via reg 4
             self._data_index = 0
@@ -176,14 +193,16 @@ class SASIController(IODevice):
         We reverse this to recover the logical sector, then add 1 because
         the AMOS disk image reserves LBA 0 (logical sector N → image LBA N+1).
         """
-        track = self._sno               # Reg 3: track / cylinder low
-        sector = self._sct               # Reg 2: sector number (1-based)
-        head = (self._sdh >> 4) & 1      # SDH bit 4: head select
+        track = ((self._cylinder_high << 8) | self._cylinder_low)
+        sector = self._sector_number
+        head = (self._sdh >> 4) & 1
         spt = 10
         physical = track * spt + (max(sector, 1) - 1)
-        lba = physical * 2 + head + 1   # +1: AMOS data starts at image LBA 1
+        lba = physical * 2 + head + 1
 
-        self._trace(f"READ SECTOR: track={track} sec={sector} → LBA={lba}")
+        self._trace(
+            f"READ SECTOR: cyl={track} sec={sector} head={head} → LBA={lba}"
+        )
 
         if self.target is not None:
             data = self.target.read_sectors(lba, 1)
@@ -206,6 +225,9 @@ class SASIController(IODevice):
         self._ready = False
         self._error_bits = 0x00
         self._err_reg = 0x00
+        self._sector_number = 0x00
+        self._cylinder_low = 0x00
+        self._cylinder_high = 0x00
         self._sct = 0x00
         self._sno = 0x00
         self._cyh = 0x00

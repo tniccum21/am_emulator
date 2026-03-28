@@ -17,21 +17,17 @@ Register map (odd addresses only):
 Note: Reading with RS2=0 (reg 0 or reg 1 addresses) always returns the
 Status Register.
 
-Control Register 1/3 bits:
-    Bit 0: Output enable
-    Bit 1: Interrupt enable
-    Bits 2-4: Operating mode
-    Bit 6: Internal/external clock (0=external, 1=internal)
-    Bit 7: CR1 only — timer system preset (0=counting, 1=held)
-           CR3 only — T3 prescale (0=off, 1=divide by 8)
+Control Register bits common to all three timers:
+    Bit 1: Clock source (0=external clock input, 1=Enable clock)
+    Bit 2: Counting mode (0=16-bit, 1=dual 8-bit)
+    Bits 3-5: Operating mode
+    Bit 6: Interrupt enable
+    Bit 7: Output enable
 
-Control Register 2 bits (shifted layout — T2 controls at bits 1-7):
-    Bit 0: CR10 — register select (0=CR3, 1=CR1 for reg 0 writes)
-    Bit 1: T2 output enable
-    Bit 2: T2 interrupt enable
-    Bits 3-5: T2 operating mode
-    Bit 6: T2 count mode
-    Bit 7: T2 clock source (0=external, 1=internal)
+Control Register unique bit 0 meanings:
+    CR1 bit 0: Timer system preset (0=counting, 1=held/reset)
+    CR2 bit 0: Register select for reg 0 writes (0=CR3, 1=CR1)
+    CR3 bit 0: Timer 3 prescale (0=off, 1=divide by 8)
 
 Status Register bits (read at reg 0 or reg 1):
     Bit 0: Timer 1 interrupt flag
@@ -108,25 +104,26 @@ class Timer6840(IODevice):
     # ── Clock source and interrupt enable helpers ─────────────────
 
     def _uses_internal_clock(self, timer: int) -> bool:
-        """Check if a timer is configured for the internal clock."""
+        """Check if a timer is configured for the PTM Enable clock."""
         if timer == 0:
-            return bool(self._cr1 & 0x40)   # CR1 bit 6
+            return bool(self._cr1 & 0x02)
         elif timer == 1:
-            return bool(self._cr2 & 0x80)   # CR2 bit 7 (shifted: T2 clock)
+            return bool(self._cr2 & 0x02)
         else:
-            return bool(self._cr3 & 0x40)   # CR3 bit 6
+            return bool(self._cr3 & 0x02)
 
     def _irq_enabled(self, timer: int) -> bool:
         """Check if interrupt is enabled for a timer channel."""
         if timer == 0:
-            return bool(self._cr1 & 0x02)
+            return bool(self._cr1 & 0x40)
         elif timer == 1:
-            # Timer 2 interrupt enable is CR2 bit 2
-            # (CR2 bits 1-6 mirror CR1/CR3 bits 0-5 for timer 2,
-            #  so CR1 bit 1 = IRQ enable maps to CR2 bit 2)
-            return bool(self._cr2 & 0x04)
+            return bool(self._cr2 & 0x40)
         else:
-            return bool(self._cr3 & 0x02)
+            return bool(self._cr3 & 0x40)
+
+    def _composite_irq_asserted(self) -> bool:
+        """Return whether any flagged timer is currently interrupt-enabled."""
+        return any(self._irq_flag[i] and self._irq_enabled(i) for i in range(3))
 
     # ── IODevice interface ──────────────────────────────────────────
 
@@ -184,17 +181,31 @@ class Timer6840(IODevice):
         if (address & 1) == 0:
             return
 
+        irq_before = self._composite_irq_asserted()
+
         if reg == 0:
             # CR1 or CR3 (selected by CR2 bit 0)
             if self._cr2 & 0x01:
+                old_cr1 = self._cr1
                 self._cr1 = value
                 self._trace(f"CR1 = ${value:02X}")
-                # CR1 bit 7: timer system preset.  0 = counting, 1 = held
-                self._timers_enabled = not bool(value & 0x80)
+                # CR1 bit 0: timer system preset. 0 = counting, 1 = held/reset
+                # On 1→0 transition: simultaneously load all counters from latches
+                was_preset = bool(old_cr1 & 0x01)
+                now_preset = bool(value & 0x01)
+                if was_preset and not now_preset:
+                    for i in range(3):
+                        self._counter[i] = self._latch[i]
+                        self._irq_flag[i] = False
+                        self._clearing_armed[i] = False
+                    self._cycle_accum = 0
+                    self._trace(f"Preset release: counters loaded from latches "
+                                f"[${self._latch[0]:04X}, ${self._latch[1]:04X}, ${self._latch[2]:04X}]")
+                self._timers_enabled = not now_preset
             else:
                 self._cr3 = value
                 self._trace(f"CR3 = ${value:02X}")
-                # CR3 bit 7: T3 prescale control (not a timer reset)
+                # CR3 bit 0 controls the Timer 3 prescaler, not run/hold.
 
         elif reg == 1:
             self._cr2 = value
@@ -216,11 +227,17 @@ class Timer6840(IODevice):
             self._clearing_armed[timer] = False
             self._trace(f"Timer {timer+1} loaded = ${self._latch[timer]:04X}")
 
+        if not irq_before and self._composite_irq_asserted():
+            self._interrupt_pending = True
+            self._trace("IRQ pending: composite line asserted by control change")
+
     def tick(self, cycles: int) -> None:
         """Advance timer counters by elapsed CPU cycles.
 
-        Only timers configured for the internal clock are decremented.
-        Timers using an external clock source are not affected.
+        All timers are decremented regardless of clock source setting.
+        The AM-1200 provides a 1 MHz external clock to the MC6840,
+        matching the internal clock rate, so both sources tick at the
+        same frequency (~1 tick per 8 CPU cycles).
         """
         if not self._timers_enabled:
             return
@@ -232,9 +249,7 @@ class Timer6840(IODevice):
         self._cycle_accum %= CPU_TIMER_RATIO
 
         for i in range(3):
-            # Only decrement timers using the internal clock
-            if not self._uses_internal_clock(i):
-                continue
+            irq_before = self._composite_irq_asserted()
 
             # MC6840: counter value 0 counts as 65536 (full 16-bit period).
             # The counter decrements from N to 1, then flags on the transition
@@ -245,10 +260,10 @@ class Timer6840(IODevice):
 
             if new <= 0:
                 # Underflow occurred — counter crossed zero
-                was_flagged = self._irq_flag[i]
                 self._irq_flag[i] = True
-                # Edge-triggered: only assert pending on 0→1 transition
-                if not was_flagged:
+                # Edge-triggered AM-1200 routing: assert only when the enabled
+                # composite IRQ line rises, not for masked timer flags.
+                if not irq_before and self._composite_irq_asserted():
                     self._interrupt_pending = True
                     self._trace(f"Timer {i+1} underflow → IRQ pending")
                 # Reload from latch (continuous mode)
