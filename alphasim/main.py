@@ -91,7 +91,7 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
 
     # Connect disk image if provided
     if config.disk_image_path and config.disk_image_path.exists():
-        disk = DiskImage(config.disk_image_path)
+        disk = DiskImage(config.disk_image_path, writable=True)
         target = SCSITarget(disk)
         sasi.target = target
         scsi_bus.target = target  # Same disk for OS driver

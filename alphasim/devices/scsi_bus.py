@@ -573,8 +573,8 @@ class SCSIBusInterface(IODevice):
         self._trace(f"WRITE(10) complete: LBA={lba} count={count}")
 
         if self.target is not None and hasattr(self.target, 'write_sectors'):
-            self.target.write_sectors(lba, self._data_buffer)
-            self._status_byte = 0x00
+            ok = self.target.write_sectors(lba, self._data_buffer)
+            self._status_byte = 0x00 if ok else 0x02  # GOOD or CHECK CONDITION
         else:
             self._status_byte = 0x02
         self._emit_trace(f"SCSI WRITE complete lba={lba} count={count}")
