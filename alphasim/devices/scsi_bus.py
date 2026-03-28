@@ -313,8 +313,19 @@ class SCSIBusInterface(IODevice):
             self._complete_selection()
             return
 
-        # $80 control write during DATA_IN/DATA_OUT = DMA start
-        if value == 0x80 and self._phase in (SCSIPhase.DATA_IN, SCSIPhase.DATA_OUT):
+        # $80 control write = DMA trigger / completion signal.
+        # During DATA_IN/DATA_OUT: hardware DMA transfer.
+        # During STATUS: PIO write already completed the transfer and
+        # moved to STATUS; the $80 signals "transfer done, fire IRQ".
+        if value == 0x80 and self._phase in (
+            SCSIPhase.DATA_IN, SCSIPhase.DATA_OUT, SCSIPhase.STATUS,
+        ):
+            if self._phase == SCSIPhase.STATUS:
+                # PIO transfer already done — just schedule the IRQ
+                dma_cycles = max(200, len(self._data_buffer) * 4)
+                self._irq_delay = dma_cycles
+                self._trace("$80 during STATUS — scheduling IRQ")
+                return
             self._start_dma()
             return
 
