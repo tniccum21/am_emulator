@@ -66,7 +66,7 @@ def main():
 
     cpu.reset()
 
-    max_instructions = 50_000_000
+    max_instructions = 100_000_000
     feed_at = 5_500_000  # feed input after TRMDEF completes
 
     try:
