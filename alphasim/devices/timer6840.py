@@ -281,12 +281,15 @@ class Timer6840(IODevice):
             if new <= 0:
                 # Underflow occurred — counter crossed zero
                 self._irq_flag[i] = True
-                # Edge-triggered AM-1200 routing: assert only when the enabled
-                # composite IRQ line rises, not for masked timer flags.
-                if not irq_before and self._composite_irq_asserted():
+                # Set interrupt pending if this timer's IRQ is enabled.
+                # On real hardware the MC6840 IRQ output is level-sensitive,
+                # but we use per-underflow triggering: each underflow sets
+                # pending (cleared by IACK), giving one ISR per timer period.
+                # This avoids both the continuous-reinterrupt problem of pure
+                # level-sensitive and the stuck-composite problem of pure
+                # edge-triggered behavior.
+                if self._irq_enabled(i):
                     self._interrupt_pending = True
-                    self._trace(f"Timer {i+1} underflow → IRQ pending")
-                pass  # Flag set; edge/level logic above handles interrupt
                 # Reload from latch (continuous mode)
                 reload = self._latch[i] if self._latch[i] > 0 else 0x10000
                 # Handle multiple underflows in one tick batch
