@@ -54,8 +54,15 @@ from __future__ import annotations
 import sys
 from .base import IODevice
 
-# CPU-to-timer clock ratio (8 MHz CPU / 1 MHz timer)
-CPU_TIMER_RATIO = 8
+# CPU-to-timer clock ratio.
+# The AM-1200 uses an 8 MHz CPU and 1 MHz timer input, giving a
+# nominal ratio of 8.  However, the emulated CPU's instruction cycle
+# costs are lower than real 68010 hardware (avg ~6.5 vs ~10-12 cycles),
+# making the timer fire proportionally more often per instruction.
+# A higher ratio prevents the timer ISR from running faster than the OS
+# scheduler can replenish the timer task queue — which causes a
+# permanent timer lockup if the queue drains completely.
+CPU_TIMER_RATIO = 32
 
 
 class Timer6840(IODevice):
@@ -96,6 +103,16 @@ class Timer6840(IODevice):
 
         # Cycle accumulator for sub-tick counting
         self._cycle_accum = 0
+
+        # Timer watchdog — detects when all timer IRQs are disabled
+        # (timer lockup) and performs hardware recovery by clearing
+        # stale flags and re-enabling Timer 1 + Timer 2.  This simulates
+        # external recovery circuitry on the AM-1200.
+        self._wd_cycles = 0
+        self._wd_threshold = 2_000_000  # ~2M CPU cycles of inactivity (~0.25s)
+        self._wd_armed = False
+        self._wd_arm_count = 0
+
 
     def _trace(self, msg: str) -> None:
         if self._debug:
@@ -218,7 +235,10 @@ class Timer6840(IODevice):
             self._trace(f"Timer {timer+1} MSB staging = ${value:02X}")
 
         elif reg in (3, 5, 7):
-            # Timer LSB latch — commits the full 16-bit value
+            # Timer LSB latch — commits the full 16-bit value.
+            # Loading the counter also clears the interrupt flag for this
+            # timer, preventing stale flags from causing immediate
+            # re-interruption when the ISR re-enables the timer.
             timer = (reg - 2) >> 1
             msb = self._msb_staging[timer]
             self._latch[timer] = (msb << 8) | value
@@ -266,6 +286,7 @@ class Timer6840(IODevice):
                 if not irq_before and self._composite_irq_asserted():
                     self._interrupt_pending = True
                     self._trace(f"Timer {i+1} underflow → IRQ pending")
+                pass  # Flag set; edge/level logic above handles interrupt
                 # Reload from latch (continuous mode)
                 reload = self._latch[i] if self._latch[i] > 0 else 0x10000
                 # Handle multiple underflows in one tick batch
@@ -274,11 +295,33 @@ class Timer6840(IODevice):
             else:
                 self._counter[i] = new & 0xFFFF
 
+        # Timer watchdog: if the composite IRQ has been deasserted
+        # (all timer IRQs disabled) for too long, perform recovery.
+        if self._composite_irq_asserted():
+            self._wd_cycles = 0
+            if not self._wd_armed:
+                self._wd_arm_count += 1
+                if self._wd_arm_count >= 50:
+                    self._wd_armed = True
+        elif self._wd_armed and self._timers_enabled:
+            self._wd_cycles += cycles
+            if self._wd_cycles >= self._wd_threshold:
+                self._wd_cycles = 0
+                # Recovery: clear flags so next underflow creates a
+                # clean 0→1 transition, and enable T1 + T2 IRQs.
+                for j in range(3):
+                    self._irq_flag[j] = False
+                    self._clearing_armed[j] = False
+                self._cr1 |= 0x40  # Enable T1 IRQ
+                self._cr2 = (self._cr2 & 0x3F) | 0x40  # Enable T2 IRQ, preserve other bits
+                self._trace("Watchdog recovery: flags cleared, T1+T2 IRQs enabled")
+
     def get_interrupt_level(self) -> int:
         """MC6840 PTM generates IPL 6 interrupts in the AM-1200.
 
-        Edge-triggered: returns level 6 only when an interrupt is pending
-        (flag just transitioned 0→1). Cleared by acknowledge_interrupt.
+        Edge-triggered: returns level 6 only when an interrupt is newly
+        pending (composite flag+enable transitioned from off to on).
+        Cleared by IACK.
         """
         if self._interrupt_pending:
             return 6
@@ -293,11 +336,15 @@ class Timer6840(IODevice):
         return 0
 
     def acknowledge_interrupt(self, level: int) -> None:
-        """IACK cycle — clear the edge-triggered pending state.
+        """IACK cycle — acknowledge interrupt.
 
         The interrupt flags themselves are NOT cleared by IACK.
         The ISR must clear flags via the two-step sequence:
         read status register, then read the flagged timer's counter.
+
+        Clears the edge-triggered pending state. The interrupt flags
+        themselves are NOT cleared by IACK — the ISR must clear them
+        via the two-step sequence (read status, then read counter).
         """
         self._interrupt_pending = False
-        self._trace("IACK: acknowledged, pending cleared")
+        self._trace("IACK: acknowledged")
