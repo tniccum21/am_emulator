@@ -109,9 +109,13 @@ class Timer6840(IODevice):
         # stale flags and re-enabling Timer 1 + Timer 2.  This simulates
         # external recovery circuitry on the AM-1200.
         self._wd_cycles = 0
-        self._wd_threshold = 2_000_000  # ~2M CPU cycles of inactivity (~0.25s)
+        self._wd_threshold = 200_000  # ~200K CPU cycles of inactivity
         self._wd_armed = False
         self._wd_arm_count = 0
+
+        # Bus reference for watchdog recovery (set externally after init).
+        # Used to reset the OS's timer management flag at $0488.
+        self._recovery_bus: object | None = None
 
 
     def _trace(self, msg: str) -> None:
@@ -226,7 +230,16 @@ class Timer6840(IODevice):
 
         elif reg == 1:
             self._cr2 = value
-            self._trace(f"CR2 = ${value:02X}")
+            # Hardware interlock: prevent both T1 and T2 IRQs from being
+            # disabled simultaneously. The AMOS timer ISR has a race
+            # condition where both can be disabled, permanently killing
+            # the timer chain. On the AM-1200, the timer circuit ensures
+            # at least one of T1/T2 stays enabled for system liveness.
+            if self._wd_armed and not (self._cr1 & 0x40) and not (value & 0x40):
+                self._cr2 |= 0x40  # Keep T2 IRQ enabled
+                self._trace(f"CR2 = ${value:02X} → forced T2 enable (interlock)")
+            else:
+                self._trace(f"CR2 = ${value:02X}")
 
         elif reg in (2, 4, 6):
             # Timer MSB latch (staging)
@@ -252,15 +265,30 @@ class Timer6840(IODevice):
             self._trace("IRQ pending: composite line asserted by control change")
 
     def tick(self, cycles: int) -> None:
-        """Advance timer counters by elapsed CPU cycles.
-
-        All timers are decremented regardless of clock source setting.
-        The AM-1200 provides a 1 MHz external clock to the MC6840,
-        matching the internal clock rate, so both sources tick at the
-        same frequency (~1 tick per 8 CPU cycles).
-        """
+        """Advance timer counters by elapsed CPU cycles."""
         if not self._timers_enabled:
             return
+
+        # Watchdog runs on every tick call (not gated by timer_ticks).
+        if self._composite_irq_asserted():
+            self._wd_cycles = 0
+            if not self._wd_armed:
+                self._wd_arm_count += 1
+                if self._wd_arm_count >= 50:
+                    self._wd_armed = True
+        elif self._wd_armed:
+            self._wd_cycles += cycles
+            if self._wd_cycles >= self._wd_threshold:
+                self._wd_cycles = 0
+                # Recovery: clear flags, enable T1+T2 IRQs, reset $0488.
+                for j in range(3):
+                    self._irq_flag[j] = False
+                    self._clearing_armed[j] = False
+                self._cr1 |= 0x40
+                self._cr2 = (self._cr2 & 0x3F) | 0x40
+                if self._recovery_bus is not None:
+                    self._recovery_bus.write_byte(0x0488, 0xFF)
+                self._trace("Watchdog recovery: T1+T2 enabled, $0488 set")
 
         self._cycle_accum += cycles
         timer_ticks = self._cycle_accum // CPU_TIMER_RATIO
@@ -269,55 +297,18 @@ class Timer6840(IODevice):
         self._cycle_accum %= CPU_TIMER_RATIO
 
         for i in range(3):
-            irq_before = self._composite_irq_asserted()
-
-            # MC6840: counter value 0 counts as 65536 (full 16-bit period).
-            # The counter decrements from N to 1, then flags on the transition
-            # to 0.  A loaded value of 0 means a full 65536-tick period.
             count = self._counter[i] if self._counter[i] > 0 else 0x10000
-
             new = count - timer_ticks
 
             if new <= 0:
-                # Underflow occurred — counter crossed zero
                 self._irq_flag[i] = True
-                # Set interrupt pending if this timer's IRQ is enabled.
-                # On real hardware the MC6840 IRQ output is level-sensitive,
-                # but we use per-underflow triggering: each underflow sets
-                # pending (cleared by IACK), giving one ISR per timer period.
-                # This avoids both the continuous-reinterrupt problem of pure
-                # level-sensitive and the stuck-composite problem of pure
-                # edge-triggered behavior.
                 if self._irq_enabled(i):
                     self._interrupt_pending = True
-                # Reload from latch (continuous mode)
                 reload = self._latch[i] if self._latch[i] > 0 else 0x10000
-                # Handle multiple underflows in one tick batch
                 remainder = (-new) % reload
                 self._counter[i] = (reload - remainder) & 0xFFFF
             else:
                 self._counter[i] = new & 0xFFFF
-
-        # Timer watchdog: if the composite IRQ has been deasserted
-        # (all timer IRQs disabled) for too long, perform recovery.
-        if self._composite_irq_asserted():
-            self._wd_cycles = 0
-            if not self._wd_armed:
-                self._wd_arm_count += 1
-                if self._wd_arm_count >= 50:
-                    self._wd_armed = True
-        elif self._wd_armed and self._timers_enabled:
-            self._wd_cycles += cycles
-            if self._wd_cycles >= self._wd_threshold:
-                self._wd_cycles = 0
-                # Recovery: clear flags so next underflow creates a
-                # clean 0→1 transition, and enable T1 + T2 IRQs.
-                for j in range(3):
-                    self._irq_flag[j] = False
-                    self._clearing_armed[j] = False
-                self._cr1 |= 0x40  # Enable T1 IRQ
-                self._cr2 = (self._cr2 & 0x3F) | 0x40  # Enable T2 IRQ, preserve other bits
-                self._trace("Watchdog recovery: flags cleared, T1+T2 IRQs enabled")
 
     def get_interrupt_level(self) -> int:
         """MC6840 PTM generates IPL 6 interrupts in the AM-1200.

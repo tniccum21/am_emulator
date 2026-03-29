@@ -104,6 +104,9 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     scsi_bus._dma_bus = bus
     scsi_bus._dma_cpu = cpu
 
+    # Wire bus reference for timer watchdog recovery
+    timer._recovery_bus = bus
+
     return cpu, bus, led, acia
 
 
