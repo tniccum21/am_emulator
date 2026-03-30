@@ -65,6 +65,7 @@ class MC68010:
         self.stopped: bool = False
         self.cycles: int = 0
         self.halted: bool = False
+        self._timing_credit: int = 0
 
         # Instruction dispatch table (populated by opcodes module)
         self.opcode_table: list = []
@@ -80,6 +81,18 @@ class MC68010:
         # style frames (6-byte normal, 14-byte bus error) and RTE pop
         # only SR+PC (6 bytes).
         self.use_68000_frames: bool = True
+
+    def add_timing_cycles(self, cycles: int) -> None:
+        """Charge synthetic cycles for accelerated work.
+
+        Some trace-hook accelerators collapse tight software loops by
+        updating registers directly before the next instruction executes.
+        Devices still need to observe the skipped elapsed time, so the
+        hook can accumulate synthetic cycles here and `step()` will return
+        them along with the real instruction cost.
+        """
+        if cycles > 0:
+            self._timing_credit += cycles
 
     def supports_control_register(self, control_register: int) -> bool:
         """Return whether MOVEC may access the given control register."""
@@ -359,6 +372,7 @@ class MC68010:
             return 4  # idle cycles while waiting for interrupt
 
         # Trace hook for debugging
+        self._timing_credit = 0
         if self.trace_hook:
             self.trace_hook(self)
 
@@ -375,7 +389,7 @@ class MC68010:
             if self.opcode_table:
                 handler = self.opcode_table[opword]
                 if handler is not None:
-                    cost = handler(self, opword)
+                    cost = handler(self, opword) + self._timing_credit
                     self.cycles += cost
                     return cost
 
@@ -383,7 +397,7 @@ class MC68010:
             self.pc = (self.pc - 2) & 0xFFFFFF  # back up PC to point at bad opcode
             from .exceptions import execute_exception
             execute_exception(self, 4)  # vector 4 = illegal instruction
-            cost = 34
+            cost = 34 + self._timing_credit
             self.cycles += cost
             return cost
 
@@ -396,6 +410,6 @@ class MC68010:
             # already-advanced PC matches that expectation and prevents
             # infinite restart loops (e.g. ROM checksum scan past ROM end).
             execute_bus_error(self, e.address, e.is_write, self.pc)
-            cost = 126  # approximate bus error exception processing cycles
+            cost = 126 + self._timing_credit  # approximate exception timing
             self.cycles += cost
             return cost

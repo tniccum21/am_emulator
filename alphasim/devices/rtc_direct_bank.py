@@ -14,9 +14,8 @@ set forever, so this model guarantees that bit clears.
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from .base import IODevice
+from .rtc_shared import RTCSharedState
 
 
 class RTCDirectBank(IODevice):
@@ -25,29 +24,15 @@ class RTCDirectBank(IODevice):
     _BASE_ADDR = 0xFFFE40
     _LAST_REG_OFFSET = 0x1A
 
-    def __init__(self) -> None:
-        self._regs: list[int] = [0] * 14
+    def __init__(
+        self,
+        shared_state: RTCSharedState | None = None,
+        *,
+        tick_owner: bool = True,
+    ) -> None:
+        self._clock = shared_state or RTCSharedState()
+        self._tick_owner = tick_owner
         self._control: int = 0
-        self._sync_from_host()
-
-    def _sync_from_host(self) -> None:
-        """Snapshot host time into the direct BCD register bank."""
-        now = datetime.now()
-        self._regs[0] = now.second % 10
-        self._regs[1] = now.second // 10
-        self._regs[2] = now.minute % 10
-        self._regs[3] = now.minute // 10
-        self._regs[4] = now.hour % 10
-        self._regs[5] = now.hour // 10
-        self._regs[6] = (now.weekday() + 1) % 7  # Python Mon=0, device Sun=0
-        self._regs[7] = now.day % 10
-        self._regs[8] = now.day // 10
-        self._regs[9] = now.month % 10
-        self._regs[10] = now.month // 10
-        yr = now.year % 100
-        self._regs[11] = yr % 10
-        self._regs[12] = yr // 10
-        self._regs[13] = self._control & 0x0F
 
     def _decode_reg(self, address: int) -> int | None:
         addr = address & 0xFFFFFF
@@ -64,7 +49,7 @@ class RTCDirectBank(IODevice):
             # Native code polls bit 1 here; keep it clear so the handshake can
             # complete instead of spinning on open-bus $FF.
             return self._control & 0xFD
-        return self._regs[reg] & 0x0F
+        return self._clock.read_reg(reg) & 0x0F
 
     def write(self, address: int, size: int, value: int) -> None:
         reg = self._decode_reg(address)
@@ -72,6 +57,9 @@ class RTCDirectBank(IODevice):
             return
         if reg == 13:
             self._control = value & 0xFF
-            self._sync_from_host()
             return
-        self._regs[reg] = value & 0x0F
+        self._clock.write_reg(reg, value & 0x0F)
+
+    def tick(self, cycles: int) -> None:
+        if self._tick_owner:
+            self._clock.tick(cycles)

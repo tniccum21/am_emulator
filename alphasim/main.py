@@ -26,6 +26,7 @@ from .devices.timer6840 import Timer6840
 from .devices.timer8253 import Timer8253
 from .devices.rtc_direct_bank import RTCDirectBank
 from .devices.rtc_msm5832 import RTC_MSM5832
+from .devices.rtc_shared import RTCSharedState
 from .devices.scsi_bus import SCSIBusInterface
 from .storage.disk_image import DiskImage
 from .storage.scsi_target import SCSITarget
@@ -57,11 +58,16 @@ def build_system(config: SystemConfig) -> tuple[MC68010, MemoryBus, LED, ACIA685
     bus.register_device(0xFFFE03, 0xFFFE03, dip)
 
     # MSM5832 RTC at $FFFE04-$FFFE05
-    rtc = RTC_MSM5832()
+    # Drive the RTC from emulated machine time rather than host wall time.
+    # AMOS command paths can poll until the clock advances; tying that to the
+    # host's next real second injects visible latency into TIME/DATE even when
+    # the emulated machine is otherwise running quickly.
+    rtc_clock = RTCSharedState(time_source=None)
+    rtc = RTC_MSM5832(rtc_clock, tick_owner=True)
     bus.register_device(0xFFFE04, 0xFFFE05, rtc)
 
     # Native AMOSL.MON also probes a direct-mapped clock/date bank here.
-    rtc_direct = RTCDirectBank()
+    rtc_direct = RTCDirectBank(rtc_clock, tick_owner=False)
     bus.register_device(0xFFFE40, 0xFFFE5F, rtc_direct)
 
     # MC6840 PTM timer at $FFFE10-$FFFE1F (odd byte addresses)

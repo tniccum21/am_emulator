@@ -18,44 +18,31 @@ MSM5832 register map (each returns a BCD nibble):
   6: Day of week (0-6)     13: Reference/control
 """
 
-from datetime import datetime
 from .base import IODevice
+from .rtc_shared import RTCSharedState
 
 
 class RTC_MSM5832(IODevice):
     """MSM5832 real-time clock chip."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        shared_state: RTCSharedState | None = None,
+        *,
+        tick_owner: bool = True,
+    ):
         self._command: int = 0  # last command byte written to $FFFE04
         self._hold_active: bool = False
-        # Internal BCD registers (writable by OS for SET DATE)
-        self._regs: list[int] = [0] * 14
-        self._sync_from_host()
-
-    def _sync_from_host(self) -> None:
-        """Load current host time into internal BCD registers."""
-        now = datetime.now()
-        self._regs[0] = now.second % 10
-        self._regs[1] = now.second // 10
-        self._regs[2] = now.minute % 10
-        self._regs[3] = now.minute // 10
-        self._regs[4] = now.hour % 10
-        self._regs[5] = now.hour // 10
-        self._regs[6] = (now.weekday() + 1) % 7  # Python Mon=0, MSM5832 Sun=0
-        self._regs[7] = now.day % 10
-        self._regs[8] = now.day // 10
-        self._regs[9] = now.month % 10
-        self._regs[10] = now.month // 10
-        yr = now.year % 100
-        self._regs[11] = yr % 10
-        self._regs[12] = yr // 10
-        self._regs[13] = 0  # reference/control register
+        self._clock = shared_state or RTCSharedState()
+        self._tick_owner = tick_owner
+        self._latched_regs: list[int] = self._clock.copy_regs()
 
     def read(self, address: int, size: int) -> int:
         if (address & 0xFFFFFF) == 0xFFFE05:
             reg = self._command & 0x0F
             if reg < 14:
-                return self._regs[reg] & 0x0F
+                regs = self._latched_regs if self._hold_active else self._clock.copy_regs()
+                return regs[reg] & 0x0F
             return 0
         # Reading command register returns 0
         return 0
@@ -65,15 +52,18 @@ class RTC_MSM5832(IODevice):
         if addr == 0xFFFE04:
             new_command = value & 0xFF
             new_hold = bool(new_command & 0x40)
-            # Snapshot host time only on HOLD 0->1 transition. Repeated
-            # command writes while HOLD stays asserted must not keep changing
-            # the visible registers mid-read sequence.
             if new_hold and not self._hold_active:
-                self._sync_from_host()
+                self._latched_regs = self._clock.copy_regs()
             self._hold_active = new_hold
             self._command = new_command
         elif addr == 0xFFFE05:
             # Write data to selected register (SET DATE/TIME)
             reg = self._command & 0x0F
             if reg < 14:
-                self._regs[reg] = value & 0x0F
+                self._clock.write_reg(reg, value & 0x0F)
+                if self._hold_active:
+                    self._latched_regs[reg] = value & 0x0F
+
+    def tick(self, cycles: int) -> None:
+        if self._tick_owner:
+            self._clock.tick(cycles)

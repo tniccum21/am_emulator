@@ -55,14 +55,13 @@ import sys
 from .base import IODevice
 
 # CPU-to-timer clock ratio.
-# The AM-1200 uses an 8 MHz CPU and 1 MHz timer input, giving a
-# nominal ratio of 8.  However, the emulated CPU's instruction cycle
-# costs are lower than real 68010 hardware (avg ~6.5 vs ~10-12 cycles),
-# making the timer fire proportionally more often per instruction.
-# A higher ratio prevents the timer ISR from running faster than the OS
-# scheduler can replenish the timer task queue — which causes a
-# permanent timer lockup if the queue drains completely.
-CPU_TIMER_RATIO = 32
+# Hardware is 8 MHz CPU to 1 MHz PTM input, so the physical ratio is 8.
+# In practice the emulator still retires fewer effective machine cycles per
+# wall-clock second than a real AM-1200, and AMOS TIME/DATE visibly stalls if
+# we use the literal hardware ratio. A calibrated ratio of 3 keeps the PTM-
+# driven scheduler cadence close to observed interactive behavior while the
+# accelerator/timer semantics remain hardware-shaped.
+CPU_TIMER_RATIO = 3
 
 
 class Timer6840(IODevice):
@@ -103,6 +102,7 @@ class Timer6840(IODevice):
 
         # Cycle accumulator for sub-tick counting
         self._cycle_accum = 0
+        self._timer3_prescale_accum = 0
 
         # Timer watchdog — detects when all timer IRQs are disabled
         # (timer lockup) and performs hardware recovery by clearing
@@ -220,6 +220,7 @@ class Timer6840(IODevice):
                         self._irq_flag[i] = False
                         self._clearing_armed[i] = False
                     self._cycle_accum = 0
+                    self._timer3_prescale_accum = 0
                     self._trace(f"Preset release: counters loaded from latches "
                                 f"[${self._latch[0]:04X}, ${self._latch[1]:04X}, ${self._latch[2]:04X}]")
                 self._timers_enabled = not now_preset
@@ -258,6 +259,8 @@ class Timer6840(IODevice):
             self._counter[timer] = self._latch[timer]
             self._irq_flag[timer] = False
             self._clearing_armed[timer] = False
+            if timer == 2:
+                self._timer3_prescale_accum = 0
             self._trace(f"Timer {timer+1} loaded = ${self._latch[timer]:04X}")
 
         if not irq_before and self._composite_irq_asserted():
@@ -297,8 +300,23 @@ class Timer6840(IODevice):
         self._cycle_accum %= CPU_TIMER_RATIO
 
         for i in range(3):
+            # The AM-1200's live software uses timer 2 with CR2=$41, so its
+            # "external" source is clearly still driven by board hardware.
+            # The self-test-proven bad case is timer 3: when configured for an
+            # external source, it must not free-run from the PTM enable clock.
+            if i == 2 and not self._uses_internal_clock(i):
+                continue
+
+            effective_ticks = timer_ticks
+            if i == 2 and (self._cr3 & 0x01):
+                self._timer3_prescale_accum += timer_ticks
+                effective_ticks = self._timer3_prescale_accum // 8
+                self._timer3_prescale_accum %= 8
+                if effective_ticks == 0:
+                    continue
+
             count = self._counter[i] if self._counter[i] > 0 else 0x10000
-            new = count - timer_ticks
+            new = count - effective_ticks
 
             if new <= 0:
                 self._irq_flag[i] = True
