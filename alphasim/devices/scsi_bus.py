@@ -246,10 +246,16 @@ class SCSIBusInterface(IODevice):
             phase_val = int(self._phase)
 
         # Bit 0 = data-ready signal (NOT part of phase encoding).
-        # Set during target-to-initiator phases when data is available.
-        # Must be CLEAR during COMMAND phase so driver's phase detection
-        # (CMP.B #$16) matches exactly.
-        if self._req and self._phase != SCSIPhase.COMMAND:
+        # The driver uses bit 0 in two ways:
+        #   1. Phase detection: masks with $1F and compares against exact
+        #      phase values ($06=DATA_OUT, $16=COMMAND).  Bit 0 must be
+        #      CLEAR during these phases.
+        #   2. Ready polling: masks with $01 and loops until set before
+        #      reading STATUS/MESSAGE bytes ($006C42).  Bit 0 must be
+        #      SET during DATA_IN, STATUS, and MESSAGE_IN.
+        if self._req and self._phase not in (
+            SCSIPhase.COMMAND, SCSIPhase.DATA_OUT, SCSIPhase.BUS_FREE,
+        ):
             phase_val |= 0x01
 
         return phase_val
@@ -307,8 +313,19 @@ class SCSIBusInterface(IODevice):
             self._complete_selection()
             return
 
-        # $80 control write during DATA_IN/DATA_OUT = DMA start
-        if value == 0x80 and self._phase in (SCSIPhase.DATA_IN, SCSIPhase.DATA_OUT):
+        # $80 control write = DMA trigger / completion signal.
+        # During DATA_IN/DATA_OUT: hardware DMA transfer.
+        # During STATUS: PIO write already completed the transfer and
+        # moved to STATUS; the $80 signals "transfer done, fire IRQ".
+        if value == 0x80 and self._phase in (
+            SCSIPhase.DATA_IN, SCSIPhase.DATA_OUT, SCSIPhase.STATUS,
+        ):
+            if self._phase == SCSIPhase.STATUS:
+                # PIO transfer already done — just schedule the IRQ
+                dma_cycles = max(200, len(self._data_buffer) * 4)
+                self._irq_delay = dma_cycles
+                self._trace("$80 during STATUS — scheduling IRQ")
+                return
             self._start_dma()
             return
 
@@ -573,8 +590,8 @@ class SCSIBusInterface(IODevice):
         self._trace(f"WRITE(10) complete: LBA={lba} count={count}")
 
         if self.target is not None and hasattr(self.target, 'write_sectors'):
-            self.target.write_sectors(lba, self._data_buffer)
-            self._status_byte = 0x00
+            ok = self.target.write_sectors(lba, self._data_buffer)
+            self._status_byte = 0x00 if ok else 0x02  # GOOD or CHECK CONDITION
         else:
             self._status_byte = 0x02
         self._emit_trace(f"SCSI WRITE complete lba={lba} count={count}")

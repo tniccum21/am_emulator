@@ -54,3 +54,36 @@ def test_timer2_irq_uses_cr2_bit6_for_native_wait_sequence() -> None:
 
     assert timer._irq_flag[1] is True
     assert timer.get_interrupt_level() == 6
+
+
+def test_timer3_external_clock_does_not_advance_without_input_ticks() -> None:
+    timer = Timer6840()
+
+    timer.write(Timer6840.BASE + 0x03, 1, 0x00)  # select CR3 on reg0 writes
+    timer.write(Timer6840.BASE + 0x01, 1, 0x00)  # CR3: external clock, no prescale
+    timer.write(Timer6840.BASE + 0x03, 1, 0x01)  # select CR1 again
+    timer.write(Timer6840.BASE + 0x01, 1, 0x00)  # release preset
+    timer.write(Timer6840.BASE + 0x0D, 1, 0x00)
+    timer.write(Timer6840.BASE + 0x0F, 1, 0x01)
+
+    timer.tick(CPU_TIMER_RATIO * 4)
+
+    assert timer._counter[2] == 0x0001
+    assert timer._irq_flag[2] is False
+
+
+def test_timer3_prescaler_divides_internal_clock_by_eight() -> None:
+    timer = Timer6840()
+
+    timer.write(Timer6840.BASE + 0x03, 1, 0x00)  # select CR3 on reg0 writes
+    timer.write(Timer6840.BASE + 0x01, 1, 0x03)  # CR3: prescale /8, internal clock
+    timer.write(Timer6840.BASE + 0x03, 1, 0x01)  # select CR1 again
+    timer.write(Timer6840.BASE + 0x01, 1, 0x00)  # release preset
+    timer.write(Timer6840.BASE + 0x0D, 1, 0x00)
+    timer.write(Timer6840.BASE + 0x0F, 1, 0x02)
+
+    timer.tick(CPU_TIMER_RATIO * 7)
+    assert timer._counter[2] == 0x0002
+
+    timer.tick(CPU_TIMER_RATIO)
+    assert timer._counter[2] == 0x0001

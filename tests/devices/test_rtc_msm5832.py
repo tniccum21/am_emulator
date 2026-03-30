@@ -1,61 +1,65 @@
 from __future__ import annotations
 
-from datetime import datetime as real_datetime
-
-import alphasim.devices.rtc_msm5832 as rtc_mod
 from alphasim.devices.rtc_msm5832 import RTC_MSM5832
+from alphasim.devices.rtc_shared import RTCSharedState
+from datetime import datetime
 
 
-def _patch_now(monkeypatch, values):
-    seq = iter(values)
+def _make_time_source(start: float = 0.0):
+    state = {"now": start}
 
-    class FakeDateTime:
-        @classmethod
-        def now(cls):
-            return next(seq)
+    def now() -> float:
+        return state["now"]
 
-    monkeypatch.setattr(rtc_mod, "datetime", FakeDateTime)
+    return state, now
 
 
-def test_hold_snapshots_only_on_rising_edge(monkeypatch) -> None:
-    _patch_now(
-        monkeypatch,
-        [
-            real_datetime(2026, 3, 20, 12, 34, 56),
-            real_datetime(2031, 9, 8, 7, 6, 5),
-            real_datetime(2044, 1, 2, 3, 4, 5),
-        ],
+def test_hold_freezes_visible_time_until_release() -> None:
+    clock, now = _make_time_source()
+    shared = RTCSharedState(
+        start_time=datetime(2026, 3, 20, 12, 34, 56),
+        time_source=now,
     )
-    rtc = RTC_MSM5832()
+    rtc = RTC_MSM5832(shared)
 
-    # First HOLD assertion snapshots the second fake time.
-    rtc.write(0xFFFE04, 1, 0x4D)
-    assert rtc._hold_active is True
-    assert rtc._regs[12] == 3  # year tens from 2031
+    rtc.write(0xFFFE04, 1, 0x10)  # READ + reg 0
+    assert rtc.read(0xFFFE05, 1) == 6
 
-    # Rewriting another HOLD command must not resnapshot while HOLD stays high.
-    rtc.write(0xFFFE04, 1, 0x5C)
-    assert rtc._regs[12] == 3
+    rtc.write(0xFFFE04, 1, 0x10 | 0x40)  # HOLD + READ + reg 0
+    clock["now"] += 2.0
+    rtc.tick(0)
+    assert rtc.read(0xFFFE05, 1) == 6
 
-    # Dropping HOLD and asserting it again should take a fresh snapshot.
-    rtc.write(0xFFFE04, 1, 0x00)
-    assert rtc._hold_active is False
-    rtc.write(0xFFFE04, 1, 0x4D)
-    assert rtc._regs[12] == 4  # year tens from 2044
+    rtc.write(0xFFFE04, 1, 0x10)  # release HOLD
+    assert rtc.read(0xFFFE05, 1) == 8
 
 
-def test_observed_hold_then_year_tens_read(monkeypatch) -> None:
-    _patch_now(
-        monkeypatch,
-        [
-            real_datetime(2026, 3, 20, 12, 34, 56),
-            real_datetime(2026, 3, 20, 12, 34, 56),
-        ],
+def test_write_updates_shared_time_registers() -> None:
+    clock, now = _make_time_source()
+    shared = RTCSharedState(
+        start_time=datetime(2026, 3, 20, 12, 34, 56),
+        time_source=now,
     )
-    rtc = RTC_MSM5832()
+    rtc = RTC_MSM5832(shared)
 
-    # Observed native service sequence writes reg 13 under HOLD/READ, then
-    # reg 12 under HOLD/READ and reads the data nibble.
+    rtc.write(0xFFFE04, 1, 0x40 | 0x10 | 0x00)
+    rtc.write(0xFFFE05, 1, 9)
+    rtc.write(0xFFFE04, 1, 0x10 | 0x00)
+    assert rtc.read(0xFFFE05, 1) == 9
+
+    clock["now"] += 1.0
+    rtc.tick(0)
+    assert rtc.read(0xFFFE05, 1) == 0
+
+
+def test_observed_hold_then_year_tens_read() -> None:
+    _clock, now = _make_time_source()
+    shared = RTCSharedState(
+        start_time=datetime(2026, 3, 20, 12, 34, 56),
+        time_source=now,
+    )
+    rtc = RTC_MSM5832(shared)
+
     rtc.write(0xFFFE04, 1, 0x4D)
     rtc.write(0xFFFE04, 1, 0x5C)
 

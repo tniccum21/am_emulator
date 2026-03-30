@@ -111,6 +111,7 @@ class LoopAccelerator:
                 low16 = cpu.d[reg] & 0xFFFF
                 if low16 > 1:
                     cpu.d[reg] = cpu.d[reg] & 0xFFFF0000
+                    cpu.add_timing_cycles(low16 * 10)
                     self.dbcc_accel_count += 1
 
         # ── SUBQ+BNE delay loop acceleration ──
@@ -118,7 +119,7 @@ class LoopAccelerator:
         if (
             pc == self._prev2_pc
             and self._prev_pc == pc + 2
-            and 0x4000 <= pc < 0x10000
+            and pc < 0x10000
         ):
             if pc == self._loop_pc:
                 self._loop_count += 1
@@ -141,9 +142,18 @@ class LoopAccelerator:
                     and (op2 & 0xFF00) == 0x6600
                 ):
                     reg = op1 & 7
-                    cpu.d[reg] = 1
-                    self._loop_count = 0
-                    self.subq_accel_count += 1
+                    data = (op1 >> 9) & 7
+                    if data == 0:
+                        data = 8
+                    size = 2 if (op1 & 0x00C0) == 0x0040 else 4
+                    mask = 0xFFFF if size == 2 else 0xFFFFFFFF
+                    current = cpu.d[reg] & mask
+                    if current > data:
+                        skipped_iters = (current - 1) // data
+                        cpu.d[reg] = (cpu.d[reg] & ~mask) | data
+                        cpu.add_timing_cycles(skipped_iters * 14)
+                        self._loop_count = 0
+                        self.subq_accel_count += 1
         else:
             if pc != self._loop_pc and self._prev_pc != self._loop_pc:
                 self._loop_count = 0
